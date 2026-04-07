@@ -2,11 +2,11 @@
 Find unique barcode k-mers within the Ori and Ter regions of each strain's
 chromosome, verified unique against every genome and plasmid in the dataset.
 
-Algorithm (two-phase, memory-efficient):
+Algorithm:
   Phase 1 — collect all candidate k-mers that slide across the Ori/Ter
              segments of every isolate.  Each interval in a wrapped Ori range
              (e.g. "6666100 - 7010776 and 0 - 356401") is treated as an
-             independent segment because the chromosome is linear.
+             independent segment (linear).
   Phase 2 — count how many times each candidate appears (canonical form =
              lexicographic min of forward and RC) across ALL sequence records
              in the background directory (genome + plasmids for all isolates).
@@ -23,8 +23,8 @@ Usage:
     ONLY_GENOME_DIR – folder of chromosome-only FASTA files (only_genome/)
     BACKGROUND_DIR  – folder of genome+plasmid FASTA files
                       (genome_and_plasmids_within_host/)
-    MIN_LENGTH      – minimum barcode length in bp (e.g. 60)
-    MAX_LENGTH      – maximum barcode length in bp (e.g. 80)
+    MIN_LENGTH      – minimum barcode length in bp (e.g. 20)
+    MAX_LENGTH      – maximum barcode length in bp (e.g. 40) [you can match MIN_LENGTH and MAX_LENGTH for specific barcode length]
 
 Output:
     ./output/KMERS/unique_barcodes_k<MIN>_<MAX>.csv  — all lengths combined
