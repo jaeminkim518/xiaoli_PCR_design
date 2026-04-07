@@ -35,6 +35,7 @@ import time as timer
 from read_file_func import (
     find_fasta_files,
     parse_sequences,
+    parse_all_records_from_dir,
     parse_all_records_except,
     load_unique_barcodes,
 )
