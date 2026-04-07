@@ -11,6 +11,7 @@ Find a unique 20 bp sequence within each strain's Ori and Ter regions, then desi
 ```
 project/
 ├── barcode_ranges_in_genome.csv          # Ori_5%_Range and Ter_5%_Range per isolate
+├── amplicon_design_env.yml
 ├── only_genome/                          # chromosome-only FASTA, one file per isolate
 │   ├── KL1_1.fasta
 │   ├── KL13_1.fasta
