@@ -1,7 +1,6 @@
 """
 Find candidate amplicons and primers for each sequence.
 
-Changes from the original version:
   - Sequences come from two directories:
       only_genome/          — chromosome-only FASTA (one per isolate), used as
                               the template for primer design.
@@ -12,7 +11,6 @@ Changes from the original version:
   - Barcodes are loaded from the region-aware kmer_generation output CSV,
     which stores 0-based chromosomal positions and tags each barcode with its
     Ori/Ter region and segment.
-  - PRODUCT_SIZE_RANGE is widened to accommodate 60–100 bp barcodes.
 
 Usage (called from SLURM array script):
     python individual_target_amplicon_candidates.py \\
