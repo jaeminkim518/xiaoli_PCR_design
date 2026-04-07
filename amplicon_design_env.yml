@@ -1,0 +1,19 @@
+name: amplicon_design
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - pandas
+  - biopython
+  - primer3-py
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - statsmodels
+  - jupyterlab
+  - ipykernel
+  - pip
