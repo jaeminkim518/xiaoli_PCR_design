@@ -169,9 +169,13 @@ if __name__ == "__main__":
     target_seqs = {SEQ_ID: target_seqs_all[SEQ_ID]}
 
     # ── Off-target background ─────────────────────────────────────────────
-    isolate_prefix = re.sub(r'_\d+$', '', SEQ_ID)  # e.g. "KL13_1" → "KL13"
-    off_target_seqs = parse_all_records_except(BACKGROUND_DIR, exclude_prefix=isolate_prefix)
-    specificity_seqs = {SEQ_ID: target_seqs[SEQ_ID], **off_target_seqs}
+    # Load ALL records from genome_and_plasmids including the target strain's
+    # own file — so primers are also checked for off-target binding within
+    # the target strain's own chromosome and plasmids.
+    # is_primer_pair_specific() excludes seq_id (the target sequence) from
+    # the check, so the intended amplification site is still allowed.
+    off_target_seqs = parse_all_records_from_dir(BACKGROUND_DIR)
+    specificity_seqs = off_target_seqs
 
     # ── Primer3 config ────────────────────────────────────────────────────
     PRODUCT_SIZE_RANGE = [80, 120]
