@@ -1,14 +1,6 @@
 """
 Select an optimal combination of amplicons and primers across all isolates.
 
-Changes from the original version:
-  - Sequences for cross-reactivity checking are loaded from the
-    genome_and_plasmids_within_host directory (all records: chromosomes +
-    plasmids for every isolate), ensuring no cross-amplification with plasmids.
-  - Candidate primer directories follow the new naming convention
-    (barcodes_k<N>_amplicon_candidates/).
-  - min_hamming_dist applies to barcodes of the designated length (60–100 bp).
-
 Usage:
     python design_amplicon.py <seed> <RANGES_CSV> <ONLY_GENOME_DIR> \\
                                <BACKGROUND_DIR> <BARCODE_LENGTH>
