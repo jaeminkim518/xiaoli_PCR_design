@@ -132,7 +132,7 @@ def select_optimal_combination_weighted(all_candidates, min_hamming_distance):
 # ---------------------------------------------------------------------------
 
 def check_cross_reactivity(candidate_primers, all_sequences,
-                            max_pcr_product=300, seed_len=10, max_mismatches=2):
+                            max_pcr_product=300, seed_len=9, max_mismatches=2):
     """
     All-against-all specificity check.
     all_sequences should include ALL genome + plasmid records for all isolates.
@@ -259,7 +259,7 @@ if __name__ == "__main__":
     t_start = timer.perf_counter()
     problematic_pairs = check_cross_reactivity(
         selection, all_sequences,
-        max_pcr_product=300, seed_len=12, max_mismatches=2,
+        max_pcr_product=300, seed_len=9, max_mismatches=2,
     )
     print(f" done ({timer.perf_counter() - t_start:.2f}s)")
 
