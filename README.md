@@ -7,7 +7,6 @@ Find a unique 20 bp sequence within each strain's Ori and Ter regions, then desi
 ---
 
 ## Directory layout
-
 ```
 project/
 ├── barcode_ranges_in_genome.csv          # Ori_5%_Range and Ter_5%_Range per isolate
@@ -26,9 +25,9 @@ project/
 ├── read_file_func.py
 ├── sequence_alignment.py
 ├── candidates.sh
-└── design_array.sh
-└── add_amplicons.py
-└── addition_array.sh                 # writes to ./output/barcodes_k20_amplicon_addition/
+├── design_array.sh
+├── add_amplicons.py                      # Stage 4 (optional)
+└── addition_array.sh
 ```
 
 ---
@@ -333,3 +332,20 @@ All parameters are set at the top of each script or shell file.
 | min_hamming_dist | `design_amplicon.py` | 2 | Min edit distance between same-length barcodes in Stage 3 |
 | --array | `candidates.sh` | 0-17 | Must match number of isolates (0 to N-1) |
 | --array | `design_array.sh` | 1-20 | Number of random seeds to try |
+| --array | `addition_array.sh` | 1-20 | Number of random seeds to try in Stage 4 |
+
+Stage 4 is configured by command-line flags on `add_amplicons.py` (`--help` for all of them):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--locked` | — | validated_primers CSV whose amplicons must not change |
+| `--length` / `--max-length` | — | barcode lengths used in Stage 1; sets the file suffix |
+| `--mode` | `add` | `add` or `audit` (audit checks the panel and designs nothing) |
+| `--targets` | all unlocked | file of `SEQ_ID,Region` or bare `SEQ_ID` lines |
+| `--unlock` | — | release locked targets so they can be re-designed |
+| `--new-isolates` | targets | file of new Seq_IDs; scopes audit A3 |
+| `--num-barcodes` | 100 | barcodes sampled per target in Step 0 |
+| `--min-hamming` | 2 | minimum barcode separation from the locked panel and among new targets |
+| `--product-size-range` | `80,120` | Primer3 amplicon size range |
+| `--retry` | off | multi-round retry loop |
+| `--seed-len` | 9 | 3' exact seed length for off-target search; lower is more sensitive and slower |
