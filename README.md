@@ -7,6 +7,7 @@ Find a unique 20 bp sequence within each strain's Ori and Ter regions, then desi
 ---
 
 ## Directory layout
+
 ```
 project/
 ├── barcode_ranges_in_genome.csv          # Ori_5%_Range and Ter_5%_Range per isolate
@@ -101,38 +102,6 @@ Each file contains primer pairs that:
 - Do not amplify any other strain's genome or plasmids
 
 Do NOT proceed to Stage 3 until all Stage 2 jobs are finished.
-
----
-
-### Stage 3 — Select optimal multiplex combination *(SLURM array, one job per seed)*
-
-```bash
-sbatch design_array.sh
-```
-
-Monitor until all jobs complete:
-```bash
-squeue -u <your_username>
-```
-
-Output: `./output/barcodes_k20_amplicon_design/`
-One CSV per seed: `validated_primers_k20-seed<N>.csv`
-
-Each output file contains up to 36 primer pairs (18 Ori + 18 Ter) that:
-- Are collectively unique and distinguishable (Hamming distance check)
-- Do not form primer dimers with each other
-- Do not cross-amplify any other strain when run together in multiplex
-
----
-
-### Selecting the best result
-
-Find the seed with the most amplicons:
-```bash
-wc -l ./output/barcodes_k20_amplicon_design/*.csv
-```
-The file with the most lines (subtract 1 for the header) is your best result.
-A perfect run yields 37 lines (36 amplicons + 1 header).
 
 ---
 
