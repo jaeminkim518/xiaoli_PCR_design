@@ -1,346 +1,449 @@
 """
-rescue_amplicon.py — locked-set amplicon design
-===============================================
-One script for the two situations where part of the panel is already fixed:
+Add amplicons to an existing panel, keeping already-designed primers fixed.
 
-  MODE "rescue"  Re-attempt targets that failed a previous design run, keeping
-                 all previously validated primer pairs unchanged.
+Use this when part of the panel must not change:
+  - new isolates joined the community and their primers still need designing
+  - a Stage 3 run left some (strain, region) targets without an amplicon
 
-  MODE "extend"  Add newly acquired isolates/plasmids to an existing panel,
-                 keeping every already-synthesized barcode/primer unchanged.
-
-Both modes are the same operation: "design amplicons for target list T, given a
-locked set L that must not change." The only differences are how T is chosen and
-how hard the script audits L against sequences that were not in the original
-reference set.
+Everything in the locked CSV is reproduced verbatim in the output. Only the
+targets you ask for are designed, and they are designed to be compatible with
+the locked set.
 
 Pipeline
 --------
-  Step A  Audit the locked set against the expanded reference (extend mode).
-          Three checks that the original pipeline never performs:
-            A1. each locked barcode is still unique across old + new sequences
-            A2. each locked primer pair still amplifies only its own target
-            A3. locked_i x locked_j cross-combinations do not produce a product
-                on the newly added templates
-          Findings are reported, never silently fixed — the primers are already
-          ordered, so the decision to drop a compromised amplicon is yours.
-  Step 0  Generate fresh primer candidates for every target in T by sampling
-          barcodes from the k-mer CSV (mandatory in extend mode: new isolates
-          have no Stage-2 candidate files).
-  Step 1  Pre-filter candidates against the locked set (Hamming + primer-dimer).
-  Step 2  Joint weighted selection among the targets in T.
-  Step 2.5 Re-verify each selected pair's own-target specificity against the
-          full expanded reference (catches stale Stage-2 candidate files).
-  Step 3  Cross-reactivity: new-vs-locked and new-vs-new.
-  Step 4  Greedy conflict resolution that can only remove new targets.
-          Optional --retry loop blacklists the failing candidate and re-selects.
+  Step A   Audit the locked panel against the current reference set.
+           Stages 1-3 guarantee uniqueness and specificity only against the
+           FASTAs present when they ran, so adding isolates can retroactively
+           break an already-synthesized amplicon. Three checks:
+             A1  each locked barcode still occurs exactly once, in its own
+                 chromosome record
+             A2  each locked primer pair still amplifies only its own target
+             A3  two locked primer pairs do not cross-amplify on a newly
+                 added record
+           Findings are reported, never repaired — the oligos already exist,
+           so what to do about a broken amplicon is your call.
+  Step 0   Design fresh primer candidates for each target (Primer3 + specificity),
+           region by region, sampling from the Stage 1 barcode CSV.
+  Step 1   Drop candidates incompatible with the locked set (barcode Hamming
+           distance + cross-dimer).
+  Step 2   Weighted joint selection among the new targets.
+  Step 2.5 Re-verify own-target specificity of each selection against the full
+           current reference (catches stale Stage 2 candidate CSVs).
+  Step 3   Cross-reactivity: new-vs-locked and new-vs-new.
+  Step 4   Greedy conflict resolution. Locked targets are never removed.
+
+Targets are (Seq_ID, Region) pairs, matching the keys used in Stage 3, e.g.
+("KL30_1", "Ori"). Seq_ID is the only_genome filename stem and is also the
+chromosome's record id inside the corresponding genome_and_plasmids file.
 
 Usage
 -----
-  # extend an existing panel with new isolates
-  python rescue_amplicon.py --mode extend --comm comm3 --kmer 20 \
-      --min-len 80 --max-len 120 --seed 1 \
-      --locked ./output/comm3_k20_L80-120_amplicon_design/validated_primers_k20-seed1.csv \
-      --new-ids ./new_isolates.txt
+  # add every isolate that is not already in the locked panel
+  python add_amplicons.py \
+      --locked ./output/barcodes_k20_amplicon_design/validated_primers_k20-seed7.csv \
+      --only-genome ./only_genome \
+      --background ./genome_and_plasmids_within_host \
+      --length 20 --seed 1
 
-  # rescue targets that failed a previous run
-  python rescue_amplicon.py --mode rescue --comm comm3 --kmer 20 \
-      --min-len 80 --max-len 120 --seed 1 \
-      --locked ./output/comm3_k20_L80-120_amplicon_design/validated_primers_k20-seed1.csv \
-      --targets ./output/comm3_k20_L80-120_amplicon_design/failed_targets_k20-seed1.txt
+  # audit only: did the new isolates break the existing panel?
+  python add_amplicons.py --mode audit --locked <csv> \
+      --only-genome ./only_genome --background ./genome_and_plasmids_within_host \
+      --length 20
 
-  # audit only: is my existing panel still valid now that new plasmids exist?
-  python rescue_amplicon.py --mode audit --comm comm3 --kmer 20 \
-      --min-len 80 --max-len 120 --locked <validated.csv> --new-ids new_isolates.txt
-
-Legacy positional form (equivalent to --mode rescue) is still accepted:
-  python rescue_amplicon.py <seed> <COMM> <KMER> <MIN_LEN> <MAX_LEN> <locked.csv> <failed.txt>
+  # design only specific targets
+  printf 'KL30_1,Ori\nKL30_1,Ter\nKL13_1,Ter\n' > targets.txt
+  python add_amplicons.py --locked <csv> --targets targets.txt ...
 """
 
 import argparse
+import csv
 import os
 import random
+import re
 import sys
 import time as timer
 
-import numpy as np
-from Bio.Seq import Seq
+# Ensure the script's own directory is on the path so local modules are found
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from read_file_func import *
+import numpy as np
+from Bio import SeqIO
+from Bio.Seq import Seq
+from pathlib import Path
+
+from read_file_func import (
+    find_fasta_files,
+    parse_sequences,
+    load_unique_barcodes,
+    load_all_candidate_primers,
+)
 from design_amplicon import (
     calculate_hamming_distance,
     has_cross_dimer,
     select_optimal_combination_weighted,
-    save_primer_results,
 )
 from individual_target_amplicon_candidates import design_candidate_primers
 from sequence_alignment import is_primer_pair_specific
 
 
+REGIONS = ("Ori", "Ter")
+
+
 # ---------------------------------------------------------------------------
-# I/O helpers
+# I/O
 # ---------------------------------------------------------------------------
 
-def load_validated_primers(csv_path):
+def load_locked_panel(csv_path):
     """
-    Reads back a validated_primers CSV (produced by save_primer_results) into
-    the dict format used throughout the pipeline.
+    Read a validated_primers CSV into {(seq_id, region): candidate_dict},
+    the same key shape Stage 3 uses. Tolerates a legacy file with no Region
+    column by assigning region ''.
     """
     locked = {}
-    with open(csv_path, 'r') as f:
-        f.readline()  # header
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(",")
-            locked[parts[0]] = {
-                'target_barcode':    parts[1],
-                'fwd_primer':        parts[2],
-                'rev_primer':        parts[3],
-                'product_size':      int(parts[4]),
-                'fwd_tm':            float(parts[5]),
-                'rev_tm':            float(parts[6]),
-                'amplicon_sequence': parts[7],
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        has_region = "Region" in (reader.fieldnames or [])
+        for row in reader:
+            seq_id = row["Seq_ID"].strip()
+            region = row["Region"].strip() if has_region else ""
+            locked[(seq_id, region)] = {
+                "target_barcode":    row["Target_Barcode"],
+                "fwd_primer":        row["Forward_Primer"],
+                "rev_primer":        row["Reverse_Primer"],
+                "product_size":      int(row["Product_Size"]),
+                "fwd_tm":            float(row["Fwd_Tm"]),
+                "rev_tm":            float(row["Rev_Tm"]),
+                "amplicon_sequence": row["Amplicon_Sequence"],
             }
+    if not has_region:
+        print("  WARNING: locked CSV has no Region column; all entries assigned "
+              "region ''. Regenerate it with the current design_amplicon.py.")
     return locked
 
 
-def load_id_list(txt_path):
-    """Reads a plain-text file with one seq_id per line ('#' comments allowed)."""
-    ids = []
-    with open(txt_path, 'r') as f:
+def save_panel(output_dir, primers, filename):
+    """Write {(seq_id, region): data} in the Stage 3 column layout."""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+    with open(output_path, "w", newline="") as f:
+        header = ["Seq_ID", "Region", "Target_Barcode", "Forward_Primer",
+                  "Reverse_Primer", "Product_Size", "Fwd_Tm", "Rev_Tm",
+                  "Amplicon_Sequence"]
+        f.write(",".join(header) + "\n")
+        for (seq_id, region), data in sorted(primers.items()):
+            row = [str(x) for x in [
+                seq_id, region, data["target_barcode"], data["fwd_primer"],
+                data["rev_primer"], data["product_size"],
+                data["fwd_tm"], data["rev_tm"], data["amplicon_sequence"],
+            ]]
+            f.write(",".join(row) + "\n")
+    print(f"  Saved {len(primers)} amplicons -> {output_path}")
+    return output_path
+
+
+def load_targets_file(txt_path):
+    """
+    One target per line. Either 'SEQ_ID,Region' or bare 'SEQ_ID'
+    (which expands to both regions). '#' starts a comment.
+    """
+    targets = []
+    with open(txt_path) as f:
         for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                ids.append(line)
-    return ids
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if "," in line:
+                seq_id, region = (p.strip() for p in line.split(",", 1))
+                targets.append((seq_id, region))
+            else:
+                targets.extend((line, r) for r in REGIONS)
+    return targets
+
+
+def parse_background_by_file(directory):
+    """
+    Load every record from every FASTA in `directory`, keeping track of which
+    file each record came from.
+
+    Returns (all_records, stem_to_record_ids):
+        all_records        {record_id: sequence_str}
+        stem_to_record_ids {filename_stem: [record_id, ...]}
+
+    Equivalent to read_file_func.parse_all_records_from_dir() but retains the
+    file grouping, which is what lets the audit tell new records from old ones.
+    """
+    all_records = {}
+    stem_to_ids = {}
+    dir_path = Path(directory)
+    fasta_files = sorted(
+        [f for f in dir_path.glob("*.fasta") if not f.name.startswith("._")] +
+        [f for f in dir_path.glob("*.fa") if not f.name.startswith("._")]
+    )
+    for fasta_file in fasta_files:
+        ids = []
+        for rec in SeqIO.parse(str(fasta_file), "fasta"):
+            all_records[rec.id] = str(rec.seq).upper()
+            ids.append(rec.id)
+        stem_to_ids[fasta_file.stem] = ids
+    print(f"Loaded {len(all_records)} records from {len(fasta_files)} files "
+          f"in '{directory}'.")
+    return all_records, stem_to_ids
+
+
+def isolate_stem_for(seq_id, stem_to_ids):
+    """
+    Find the genome_and_plasmids file that contains a given chromosome record.
+    Falls back to stripping a trailing '_<digits>' (KL13_1 -> KL13).
+    """
+    for stem, ids in stem_to_ids.items():
+        if seq_id in ids:
+            return stem
+    return re.sub(r"_\d+$", "", seq_id)
 
 
 # ---------------------------------------------------------------------------
-# Barcode distance (length-safe)
+# Barcode distance
 # ---------------------------------------------------------------------------
-
-_LENGTH_WARNED = set()
 
 def barcodes_too_close(bc_a, bc_b, min_hamming_distance):
     """
     True if two barcodes are closer than min_hamming_distance.
-
-    Hamming distance is only defined for equal-length strings. Barcodes of
-    different lengths are treated as distinguishable (they are, by read length),
-    but the mismatch is reported once so a k-mer-size mix-up cannot pass silently.
+    calculate_hamming_distance returns None for unequal lengths, which means
+    'no constraint' — different-length barcodes are inherently distinguishable.
     """
-    if len(bc_a) != len(bc_b):
-        key = (len(bc_a), len(bc_b))
-        if key not in _LENGTH_WARNED:
-            _LENGTH_WARNED.add(key)
-            print(f"  NOTE: comparing barcodes of length {len(bc_a)} and {len(bc_b)}. "
-                  f"If this is unintended, the locked panel was built with a "
-                  f"different --kmer than this run.")
-        return False
-    return calculate_hamming_distance(bc_a, bc_b) < min_hamming_distance
+    dist = calculate_hamming_distance(bc_a, bc_b)
+    return dist is not None and dist < min_hamming_distance
 
 
 # ---------------------------------------------------------------------------
-# Step A — audit the locked set against sequences it never saw
+# Step A — audit the locked panel
 # ---------------------------------------------------------------------------
 
 def count_motif_occurrences(sequences, motif):
-    """Counts motif + reverse complement hits per sequence (linear, like kmer_generation)."""
+    """Count motif + reverse complement hits per record (linear, as in Stage 1)."""
     motif = motif.upper()
     rc = str(Seq(motif).reverse_complement()).upper()
     hits = {}
-    for sid, seq in sequences.items():
+    for rec_id, seq in sequences.items():
         s = str(seq).upper()
         n = s.count(motif)
         if rc != motif:
             n += s.count(rc)
         if n:
-            hits[sid] = n
+            hits[rec_id] = n
     return hits
 
 
-def audit_locked_set(locked_primers, all_sequences, new_sequences,
-                     max_pcr_product=300, seed_len=12, max_mismatches=2,
-                     check_locked_pairs=True):
+def audit_locked_panel(locked, all_records, new_record_ids,
+                       max_pcr_product=300, seed_len=9, max_mismatches=2,
+                       check_locked_pairs=True):
     """
-    Verifies that an already-synthesized panel is still valid after new templates
-    were added to the reference set.
-
-    Returns a dict:
-        {'barcode_collisions': {seq_id: {other_seq_id: count}},
-         'nonspecific':        [seq_id, ...],
-         'cross_pairs':        [(seq_id_a, seq_id_b), ...]}
+    Returns {'unmapped': [...], 'barcode_collisions': {...},
+             'nonspecific': [...], 'cross_pairs': [...]}
+    Keys of `locked` are (seq_id, region); seq_id must be a record id in
+    all_records, otherwise the own-target amplicon cannot be excluded.
     """
-    report = {'barcode_collisions': {}, 'nonspecific': [], 'cross_pairs': []}
+    report = {"unmapped": [], "barcode_collisions": {}, "nonspecific": [],
+              "cross_pairs": []}
 
-    # A1 — barcode uniqueness across the expanded reference
-    for seq_id, data in locked_primers.items():
-        hits = count_motif_occurrences(all_sequences, data['target_barcode'])
+    # A0 — every locked Seq_ID must resolve to a record, or A1/A2 are meaningless
+    for (seq_id, region) in locked:
+        if seq_id not in all_records:
+            report["unmapped"].append((seq_id, region))
+
+    # A1 — barcode still occurs exactly once, in its own chromosome record
+    for (seq_id, region), data in locked.items():
+        hits = count_motif_occurrences(all_records, data["target_barcode"])
         total = sum(hits.values())
-        extra = {sid: n for sid, n in hits.items() if sid != seq_id}
-        if total != 1 or extra:
-            report['barcode_collisions'][seq_id] = hits
+        elsewhere = {r: n for r, n in hits.items() if r != seq_id}
+        if total != 1 or elsewhere:
+            report["barcode_collisions"][(seq_id, region)] = hits
 
-    # A2 — each locked pair still amplifies only its own target
-    for seq_id, data in locked_primers.items():
+    # A2 — pair still amplifies only its own target
+    for (seq_id, region), data in locked.items():
+        if seq_id not in all_records:
+            continue  # already reported as unmapped; would be a false positive
         if not is_primer_pair_specific(
-            data['fwd_primer'], data['rev_primer'], seq_id, all_sequences,
+            data["fwd_primer"], data["rev_primer"], seq_id, all_records,
             max_pcr_product=max_pcr_product, seed_len=seed_len,
             max_mismatches=max_mismatches,
         ):
-            report['nonspecific'].append(seq_id)
+            report["nonspecific"].append((seq_id, region))
 
-    # A3 — locked x locked cross-combinations on the NEW templates only
-    # (locked-vs-locked was already cleared against the original reference, so
-    #  restricting the search space to new templates keeps this cheap.)
-    if check_locked_pairs and new_sequences:
-        items = list(locked_primers.items())
+    # A3 — locked x locked, searched on the NEW records only. Locked pairs were
+    # already cleared against the old records in Stage 3, so restricting the
+    # search space keeps this O(n^2) check affordable.
+    if check_locked_pairs and new_record_ids:
+        new_records = {r: all_records[r] for r in new_record_ids if r in all_records}
+        items = list(locked.items())
         for i in range(len(items)):
-            id_a, a = items[i]
+            key_a, a = items[i]
             for j in range(i + 1, len(items)):
-                id_b, b = items[j]
+                key_b, b = items[j]
                 combos = [
-                    (a['fwd_primer'], b['fwd_primer']),
-                    (a['fwd_primer'], b['rev_primer']),
-                    (a['rev_primer'], b['fwd_primer']),
-                    (a['rev_primer'], b['rev_primer']),
+                    (a["fwd_primer"], b["fwd_primer"]),
+                    (a["fwd_primer"], b["rev_primer"]),
+                    (a["rev_primer"], b["fwd_primer"]),
+                    (a["rev_primer"], b["rev_primer"]),
                 ]
                 for fwd, rev in combos:
                     if not is_primer_pair_specific(
-                        fwd, rev, "", new_sequences,
+                        fwd, rev, "", new_records,
                         max_pcr_product=max_pcr_product, seed_len=seed_len,
                         max_mismatches=max_mismatches,
                     ):
-                        report['cross_pairs'].append((id_a, id_b))
+                        report["cross_pairs"].append((key_a, key_b))
                         break
 
     return report
 
 
+def _fmt(key):
+    seq_id, region = key
+    return f"{seq_id} {region}".strip()
+
+
 def print_audit(report, n_locked, n_new):
-    print(f"\n--- LOCKED-SET AUDIT ({n_locked} locked amplicons vs {n_new} new templates) ---")
+    print(f"\n--- LOCKED-PANEL AUDIT ({n_locked} locked amplicons, "
+          f"{n_new} newly added records) ---")
     clean = True
 
-    if report['barcode_collisions']:
+    if report["unmapped"]:
         clean = False
-        print(f"\n  [A1] {len(report['barcode_collisions'])} locked barcodes are no longer unique:")
-        for sid, hits in sorted(report['barcode_collisions'].items()):
-            where = ", ".join(f"{k} x{v}" for k, v in sorted(hits.items()))
-            print(f"    - {sid}: found in {where}")
+        print(f"\n  [A0] {len(report['unmapped'])} locked Seq_IDs have no matching "
+              f"record in the background directory:")
+        for k in sorted(report["unmapped"]):
+            print(f"    - {_fmt(k)}")
+        print("    Checks A1/A2 cannot exclude their own amplicon, so their "
+              "results below are unreliable. Confirm that Seq_ID matches the "
+              "chromosome record id (e.g. 'KL13_1').")
 
-    if report['nonspecific']:
+    if report["barcode_collisions"]:
         clean = False
-        print(f"\n  [A2] {len(report['nonspecific'])} locked primer pairs now amplify an off-target template:")
-        for sid in sorted(report['nonspecific']):
-            print(f"    - {sid}")
+        print(f"\n  [A1] {len(report['barcode_collisions'])} locked barcodes are "
+              f"no longer unique:")
+        for k, hits in sorted(report["barcode_collisions"].items()):
+            where = ", ".join(f"{r} x{n}" for r, n in sorted(hits.items()))
+            print(f"    - {_fmt(k)}: found in {where}")
 
-    if report['cross_pairs']:
+    if report["nonspecific"]:
         clean = False
-        print(f"\n  [A3] {len(report['cross_pairs'])} locked primer pairs cross-amplify on the new templates:")
-        for a, b in sorted(report['cross_pairs']):
-            print(f"    - {a} x {b}")
+        print(f"\n  [A2] {len(report['nonspecific'])} locked primer pairs now "
+              f"amplify an off-target record:")
+        for k in sorted(report["nonspecific"]):
+            print(f"    - {_fmt(k)}")
+
+    if report["cross_pairs"]:
+        clean = False
+        print(f"\n  [A3] {len(report['cross_pairs'])} locked primer pairs "
+              f"cross-amplify on a new record:")
+        for a, b in sorted(report["cross_pairs"]):
+            print(f"    - {_fmt(a)}  x  {_fmt(b)}")
 
     if clean:
         print("  All locked amplicons remain unique and specific. No action needed.")
     else:
-        print("\n  These amplicons are already synthesized, so nothing was changed.")
-        print("  Options: exclude the affected targets from analysis, re-design them")
-        print("  (move their IDs into --targets), or drop the offending new isolate.")
+        print("\n  Nothing was changed — these primers already exist. Options:")
+        print("    - exclude the affected amplicon from quantification")
+        print("    - add its target to --targets so a replacement is designed")
+        print("    - leave the offending new isolate out of the community")
     return clean
 
 
+def write_audit(report, output_dir, suffix):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"locked_audit_{suffix}.txt")
+    with open(path, "w") as f:
+        for k in sorted(report["unmapped"]):
+            f.write(f"seq_id_not_in_background\t{k[0]}\t{k[1]}\n")
+        for k, hits in sorted(report["barcode_collisions"].items()):
+            f.write(f"barcode_not_unique\t{k[0]}\t{k[1]}\t"
+                    f"{';'.join(f'{r}:{n}' for r, n in sorted(hits.items()))}\n")
+        for k in sorted(report["nonspecific"]):
+            f.write(f"pair_not_specific\t{k[0]}\t{k[1]}\n")
+        for a, b in sorted(report["cross_pairs"]):
+            f.write(f"locked_cross_pair\t{a[0]}\t{a[1]}\t{b[0]}\t{b[1]}\n")
+    print(f"  Audit written to: {path}")
+    return path
+
+
 # ---------------------------------------------------------------------------
-# Step 1 — pre-filter candidates against the locked set
+# Step 1 — pre-filter against the locked panel
 # ---------------------------------------------------------------------------
 
-def prefilter_candidates(locked_primers, new_candidates, min_hamming_distance):
-    """
-    Keeps only candidates compatible with ALL locked primers
-    (barcode Hamming distance + primer-dimer).
-
-    Returns (filtered_candidates, prefilter_failed_ids).
-    """
-    locked_list = list(locked_primers.values())
+def prefilter_candidates(locked, new_candidates, min_hamming_distance):
+    """Keep only candidates compatible with every locked amplicon."""
+    locked_list = list(locked.values())
     filtered = {}
     prefilter_failed = []
 
-    for seq_id, candidates in new_candidates.items():
+    for key, candidates in new_candidates.items():
         compatible = []
-        for candidate in candidates:
-            is_compatible = True
+        for cand in candidates:
+            ok = True
             for existing in locked_list:
-                if barcodes_too_close(candidate['target_barcode'],
-                                      existing['target_barcode'],
+                if barcodes_too_close(cand["target_barcode"],
+                                      existing["target_barcode"],
                                       min_hamming_distance):
-                    is_compatible = False
+                    ok = False
                     break
-                if has_cross_dimer(
-                    candidate['fwd_primer'], candidate['rev_primer'],
-                    existing['fwd_primer'], existing['rev_primer'],
-                    max_dimer_dg=-9000.0, max_3prime_dg=-9000.0,
-                ):
-                    is_compatible = False
+                if has_cross_dimer(cand["fwd_primer"], cand["rev_primer"],
+                                   existing["fwd_primer"], existing["rev_primer"]):
+                    ok = False
                     break
-            if is_compatible:
-                compatible.append(candidate)
-
+            if ok:
+                compatible.append(cand)
         if compatible:
-            filtered[seq_id] = compatible
+            filtered[key] = compatible
         else:
-            prefilter_failed.append(seq_id)
+            prefilter_failed.append(key)
 
     return filtered, prefilter_failed
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — cross-reactivity (skips locked-vs-locked; that is Step A3's job)
+# Step 3 — cross-reactivity (locked-vs-locked is Step A3's job)
 # ---------------------------------------------------------------------------
 
-def check_cross_reactivity_new(locked_primers, new_primers, all_sequences,
-                               max_pcr_product=300, seed_len=12, max_mismatches=2):
-    """Checks new-vs-locked and new-vs-new primer combinations."""
+def check_cross_reactivity_new(locked, new_primers, all_records,
+                               max_pcr_product=300, seed_len=9, max_mismatches=2):
     problematic_pairs = set()
-    locked_list = list(locked_primers.items())
+    locked_list = list(locked.items())
     new_list = list(new_primers.items())
 
-    def _check_pair(primer_A, primer_B):
+    def _conflicts(a, b):
         combos = [
-            (primer_A['fwd_primer'], primer_B['fwd_primer']),
-            (primer_A['fwd_primer'], primer_B['rev_primer']),
-            (primer_A['rev_primer'], primer_B['fwd_primer']),
-            (primer_A['rev_primer'], primer_B['rev_primer']),
+            (a["fwd_primer"], b["fwd_primer"]),
+            (a["fwd_primer"], b["rev_primer"]),
+            (a["rev_primer"], b["fwd_primer"]),
+            (a["rev_primer"], b["rev_primer"]),
         ]
         for fwd, rev in combos:
             if not is_primer_pair_specific(
-                fwd, rev, "", all_sequences,
+                fwd, rev, "", all_records,
                 max_pcr_product=max_pcr_product, seed_len=seed_len,
                 max_mismatches=max_mismatches,
             ):
                 return True
         return False
 
-    for n_id, n_data in new_list:
-        for l_id, l_data in locked_list:
-            if _check_pair(n_data, l_data):
-                problematic_pairs.add((n_id, l_id))
+    for n_key, n_data in new_list:
+        for l_key, l_data in locked_list:
+            if _conflicts(n_data, l_data):
+                problematic_pairs.add((n_key, l_key))
 
     for i in range(len(new_list)):
         for j in range(i + 1, len(new_list)):
-            a_id, a_data = new_list[i]
-            b_id, b_data = new_list[j]
-            if _check_pair(a_data, b_data):
-                problematic_pairs.add((a_id, b_id))
+            a_key, a_data = new_list[i]
+            b_key, b_data = new_list[j]
+            if _conflicts(a_data, b_data):
+                problematic_pairs.add((a_key, b_key))
 
     return problematic_pairs
 
 
-def resolve_conflicts_locked_safe(problematic_pairs, locked_ids, candidate_counts=None):
-    """
-    Greedy conflict resolution that never removes a locked target.
-    Tie-break: prefer keeping the target with fewer candidates available.
-    """
+def resolve_conflicts_locked_safe(problematic_pairs, locked_keys, candidate_counts=None):
+    """Greedy resolution that can only remove new targets."""
     if not problematic_pairs:
         return set()
 
@@ -350,54 +453,48 @@ def resolve_conflicts_locked_safe(problematic_pairs, locked_ids, candidate_count
         graph.setdefault(b, set()).add(a)
 
     alive = set(graph.keys())
-    failed_ids = set()
+    failed = set()
     counts = candidate_counts or {}
 
     def degree(n):
-        return len([nbr for nbr in graph.get(n, set()) if nbr in alive])
+        return sum(1 for nbr in graph.get(n, set()) if nbr in alive)
 
     while True:
-        candidates = [n for n in alive if degree(n) > 0 and n not in locked_ids]
-        if not candidates:
+        removable = [n for n in alive if degree(n) > 0 and n not in locked_keys]
+        if not removable:
             break
-        pick = max(candidates, key=lambda n: (degree(n), -counts.get(n, 0)))
+        pick = max(removable, key=lambda n: (degree(n), -counts.get(n, 0)))
         alive.remove(pick)
-        failed_ids.add(pick)
+        failed.add(pick)
 
-    remaining = [n for n in alive if degree(n) > 0]
-    if remaining:
-        print(f"  WARNING: {len(remaining)} locked targets still have unresolved "
-              f"cross-reactivity conflicts (they were kept anyway): {sorted(remaining)}")
-
-    return failed_ids
+    stuck = [n for n in alive if degree(n) > 0]
+    if stuck:
+        print(f"  WARNING: {len(stuck)} locked amplicons conflict with each other "
+              f"and were kept anyway: {[_fmt(k) for k in sorted(stuck)]}")
+    return failed
 
 
 # ---------------------------------------------------------------------------
-# Steps 2-4 — selection + cross-reactivity, single pass or retry loop
+# Steps 2-4
 # ---------------------------------------------------------------------------
 
-def select_and_validate(filtered_candidates, locked_primers, sequences,
-                        min_hamming_dist, max_rounds=1,
-                        max_pcr_product=300, seed_len=12, max_mismatches=2,
-                        verify_own_specificity=True):
+def select_and_validate(filtered_candidates, locked, all_records, min_hamming_dist,
+                        max_rounds=1, max_pcr_product=300, seed_len=9,
+                        max_mismatches=2):
     """
-    Runs joint selection followed by the cross-reactivity check.
-
-    max_rounds=1  -> single pass (failed targets are dropped)
-    max_rounds>1  -> retry loop (the failing candidate is blacklisted and the
-                     target competes again in the next round)
-
+    Joint selection followed by cross-reactivity.
+    max_rounds=1 is a single pass; >1 blacklists the failing candidate and retries.
     Returns (accepted, selection_failed, exhausted, still_pending).
     """
     accepted = {}
-    current = {sid: list(c) for sid, c in filtered_candidates.items()}
+    current = {k: list(v) for k, v in filtered_candidates.items()}
     selection_failed = set()
     exhausted = set()
     round_num = 0
 
     while current and round_num < max_rounds:
         round_num += 1
-        current_locked = {**locked_primers, **accepted}
+        current_locked = {**locked, **accepted}
         if max_rounds > 1:
             print(f"\n  === Round {round_num}: {len(current)} targets, "
                   f"{sum(len(v) for v in current.values())} candidates ===")
@@ -412,28 +509,28 @@ def select_and_validate(filtered_candidates, locked_primers, sequences,
         if not selection:
             break
 
-        # Step 2.5 — own-target specificity against the full expanded reference.
-        if verify_own_specificity:
-            stale = []
-            for sid, data in list(selection.items()):
-                if not is_primer_pair_specific(
-                    data['fwd_primer'], data['rev_primer'], sid, sequences,
-                    max_pcr_product=max_pcr_product, seed_len=seed_len,
-                    max_mismatches=max_mismatches,
-                ):
-                    stale.append(sid)
-            if stale:
-                print(f"  {len(stale)} selected pairs amplify an off-target template "
-                      f"and were dropped: {sorted(stale)}")
-                for sid in stale:
-                    key = (selection[sid]['fwd_primer'], selection[sid]['rev_primer'])
-                    if sid in current:
-                        current[sid] = [c for c in current[sid]
-                                        if (c['fwd_primer'], c['rev_primer']) != key]
-                        if not current[sid]:
-                            del current[sid]
-                            exhausted.add(sid)
-                    del selection[sid]
+        # Step 2.5 — own-target specificity against the current reference
+        stale = []
+        for key, data in list(selection.items()):
+            seq_id, _ = key
+            if not is_primer_pair_specific(
+                data["fwd_primer"], data["rev_primer"], seq_id, all_records,
+                max_pcr_product=max_pcr_product, seed_len=seed_len,
+                max_mismatches=max_mismatches,
+            ):
+                stale.append(key)
+        if stale:
+            print(f"  {len(stale)} selected pairs amplify an off-target record "
+                  f"and were dropped: {[_fmt(k) for k in stale]}")
+            for key in stale:
+                bl = (selection[key]["fwd_primer"], selection[key]["rev_primer"])
+                if key in current:
+                    current[key] = [c for c in current[key]
+                                    if (c["fwd_primer"], c["rev_primer"]) != bl]
+                    if not current[key]:
+                        del current[key]
+                        exhausted.add(key)
+                del selection[key]
 
         if not selection:
             continue
@@ -441,7 +538,7 @@ def select_and_validate(filtered_candidates, locked_primers, sequences,
         print("  Cross-reactivity...", end="", flush=True)
         t0 = timer.perf_counter()
         problematic_pairs = check_cross_reactivity_new(
-            current_locked, selection, sequences,
+            current_locked, selection, all_records,
             max_pcr_product=max_pcr_product, seed_len=seed_len,
             max_mismatches=max_mismatches,
         )
@@ -449,35 +546,34 @@ def select_and_validate(filtered_candidates, locked_primers, sequences,
 
         if not problematic_pairs:
             accepted.update(selection)
-            for sid in selection:
-                current.pop(sid, None)
-                selection_failed.discard(sid)
+            for key in selection:
+                current.pop(key, None)
+                selection_failed.discard(key)
             print(f"  All {len(selection)} passed. Total accepted: {len(accepted)}")
             break
 
         failed_xr = resolve_conflicts_locked_safe(
             problematic_pairs, set(current_locked.keys()), candidate_counts
         )
-        survived = {pid: d for pid, d in selection.items() if pid not in failed_xr}
+        survived = {k: v for k, v in selection.items() if k not in failed_xr}
         accepted.update(survived)
-        for sid in survived:
-            current.pop(sid, None)
-            selection_failed.discard(sid)
+        for key in survived:
+            current.pop(key, None)
+            selection_failed.discard(key)
         print(f"  {len(failed_xr)} failed cross-reactivity, {len(survived)} survived.")
 
-        # Blacklist the specific candidate that failed, then retry if allowed.
         retryable = 0
-        for sid in failed_xr:
-            key = (selection[sid]['fwd_primer'], selection[sid]['rev_primer'])
-            if sid in current:
-                current[sid] = [c for c in current[sid]
-                                if (c['fwd_primer'], c['rev_primer']) != key]
-                if current[sid]:
+        for key in failed_xr:
+            bl = (selection[key]["fwd_primer"], selection[key]["rev_primer"])
+            if key in current:
+                current[key] = [c for c in current[key]
+                                if (c["fwd_primer"], c["rev_primer"]) != bl]
+                if current[key]:
                     retryable += 1
-                    selection_failed.discard(sid)
+                    selection_failed.discard(key)
                 else:
-                    del current[sid]
-                    exhausted.add(sid)
+                    del current[key]
+                    exhausted.add(key)
 
         if max_rounds == 1:
             exhausted.update(failed_xr - set(accepted.keys()))
@@ -486,8 +582,7 @@ def select_and_validate(filtered_candidates, locked_primers, sequences,
             print("  No retryable targets. Stopping.")
             break
 
-    still_pending = set(current.keys())
-    return accepted, (selection_failed - set(accepted.keys())), exhausted, still_pending
+    return accepted, (selection_failed - set(accepted.keys())), exhausted, set(current.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -495,211 +590,232 @@ def select_and_validate(filtered_candidates, locked_primers, sequences,
 # ---------------------------------------------------------------------------
 
 def parse_args(argv):
-    # Legacy positional form: seed COMM KMER MIN MAX locked.csv failed.txt
-    if len(argv) == 8 and not argv[1].startswith("-"):
-        argv = [argv[0],
-                "--mode", "rescue",
-                "--seed", argv[1], "--comm", argv[2], "--kmer", argv[3],
-                "--min-len", argv[4], "--max-len", argv[5],
-                "--locked", argv[6], "--targets", argv[7]]
-
-    p = argparse.ArgumentParser(description="Locked-set amplicon design (rescue / extend / audit).")
-    p.add_argument("--mode", choices=["rescue", "extend", "audit"], default="rescue")
-    p.add_argument("--comm", required=True, help="community name; targets live in ./targets/<comm>")
-    p.add_argument("--kmer", type=int, required=True, help="barcode length (must match the locked panel)")
-    p.add_argument("--min-len", type=int, required=True)
-    p.add_argument("--max-len", type=int, required=True)
-    p.add_argument("--locked", required=True, help="validated_primers CSV to keep fixed")
+    p = argparse.ArgumentParser(
+        description="Add amplicons to an existing panel without changing it.")
+    p.add_argument("--locked", required=True,
+                   help="validated_primers CSV whose amplicons must not change")
+    p.add_argument("--only-genome", default="./only_genome",
+                   help="chromosome-only FASTA directory (primer design templates)")
+    p.add_argument("--background", default="./genome_and_plasmids_within_host",
+                   help="genome+plasmid FASTA directory (specificity reference)")
+    p.add_argument("--length", type=int, required=True,
+                   help="barcode MIN_LENGTH used in Stage 1")
+    p.add_argument("--max-length", type=int, default=None,
+                   help="barcode MAX_LENGTH used in Stage 1 (defaults to --length)")
+    p.add_argument("--mode", choices=["add", "audit"], default="add")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--targets", default=None,
-                   help="file of seq_ids to design (default in extend mode: every "
-                        "sequence in ./targets/<comm> that is not in --locked)")
-    p.add_argument("--new-ids", default=None,
-                   help="file of newly added seq_ids; scopes the locked-set audit")
+                   help="file of targets to design: 'SEQ_ID,Region' or bare SEQ_ID "
+                        "per line. Default: every only_genome isolate x {Ori,Ter} "
+                        "that is not already locked")
+    p.add_argument("--unlock", default=None,
+                   help="file of locked targets to release and re-design "
+                        "(same format as --targets). Use this to replace an "
+                        "amplicon the audit flagged as broken.")
+    p.add_argument("--new-isolates", default=None,
+                   help="file of newly added Seq_IDs, one per line; scopes audit A3. "
+                        "Default: the isolates being designed")
     p.add_argument("--out-dir", default=None)
     p.add_argument("--min-hamming", type=int, default=2)
     p.add_argument("--num-barcodes", type=int, default=100,
-                   help="barcodes sampled per target during candidate generation")
-    p.add_argument("--retry", action="store_true", help="enable the multi-round retry loop")
-    p.add_argument("--rounds", type=int, default=10, help="max rounds when --retry is set")
+                   help="barcodes sampled per target in Step 0")
+    p.add_argument("--flank-size", type=int, default=300)
+    p.add_argument("--product-size-range", default="80,120",
+                   help="Primer3 PRIMER_PRODUCT_SIZE_RANGE, e.g. '80,120'")
+    p.add_argument("--retry", action="store_true",
+                   help="multi-round retry loop instead of a single pass")
+    p.add_argument("--rounds", type=int, default=10)
     p.add_argument("--use-existing-candidates", action="store_true",
-                   help="also load Stage-2 candidate CSVs (only safe if they were "
-                        "generated against the current, complete reference set)")
+                   help="also load Stage 2 CSVs (only safe if regenerated against "
+                        "the current reference set)")
     p.add_argument("--no-fresh-candidates", action="store_true",
-                   help="do not run Primer3; use Stage-2 candidate CSVs only")
+                   help="skip Primer3 and use Stage 2 CSVs only")
     p.add_argument("--skip-locked-audit", action="store_true")
     p.add_argument("--skip-locked-pair-audit", action="store_true",
-                   help="skip check A3 (locked x locked on new templates); it is the slow one")
+                   help="skip check A3 only (the slow one)")
     p.add_argument("--max-pcr-product", type=int, default=300)
-    p.add_argument("--seed-len", type=int, default=12)
+    p.add_argument("--seed-len", type=int, default=9,
+                   help="3' exact seed length for off-target search (Stage 3 uses 9)")
     p.add_argument("--max-mismatches", type=int, default=2)
     return p.parse_args(argv[1:])
 
 
 def main(argv):
     args = parse_args(argv)
+    max_length = args.max_length if args.max_length is not None else args.length
+    suffix = (f"k{args.length}_{max_length}" if max_length != args.length
+              else f"k{args.length}")
 
-    SEQ_DIR = f"./targets/{args.comm}"
-    BARCODE_CSV = f"./output/KMERS/{args.comm}_k{args.kmer}.csv"
-    CANDIDATE_DIR = (f"./output/KMERS/{args.comm}_k{args.kmer}"
-                     f"_L{args.min_len}-{args.max_len}_amplicon_candidates/")
-    OUTPUT_DIR = args.out_dir or (f"./output/{args.comm}_k{args.kmer}"
-                                  f"_L{args.min_len}-{args.max_len}_amplicon_{args.mode}/")
+    BARCODE_CSV = f"./output/KMERS/unique_barcodes_{suffix}.csv"
+    CANDIDATE_DIR = f"./output/barcodes_{suffix}_amplicon_candidates/"
+    OUTPUT_DIR = args.out_dir or f"./output/barcodes_{suffix}_amplicon_addition/"
 
     np.random.seed(args.seed)
     random.seed(args.seed)
 
+    psr = [int(x) for x in args.product_size_range.split(",")]
     primer_config = {
-        'flank_size': 300,
-        'primer3_globals': {
-            'PRIMER_OPT_SIZE': 20, 'PRIMER_MIN_SIZE': 18, 'PRIMER_MAX_SIZE': 25,
-            'PRIMER_OPT_TM': 60.0, 'PRIMER_MIN_TM': 57.0, 'PRIMER_MAX_TM': 63.0,
-            'PRIMER_MIN_GC': 40.0, 'PRIMER_MAX_GC': 60.0,
-            'PRIMER_PRODUCT_SIZE_RANGE': [[args.min_len, args.max_len]],
-        }
+        "flank_size": args.flank_size,
+        "primer3_globals": {
+            "PRIMER_OPT_SIZE": 20, "PRIMER_MIN_SIZE": 18, "PRIMER_MAX_SIZE": 25,
+            "PRIMER_OPT_TM": 60.0, "PRIMER_MIN_TM": 57.0, "PRIMER_MAX_TM": 63.0,
+            "PRIMER_MIN_GC": 40.0, "PRIMER_MAX_GC": 60.0,
+            "PRIMER_PRODUCT_SIZE_RANGE": [psr],
+        },
     }
 
-    # --- Load reference ---
-    print(f"Loading sequences from {SEQ_DIR} ...")
-    sequences = parse_sequences(find_fasta_files(SEQ_DIR))
-    if not sequences:
-        print("\nERROR: No sequences were parsed. Check SEQ_DIR.")
+    # --- Reference sequences -------------------------------------------------
+    print("Loading chromosome templates...")
+    target_seqs = parse_sequences(find_fasta_files(args.only_genome))
+    if not target_seqs:
+        print(f"\nERROR: no FASTA files in {args.only_genome}.")
         return 1
-    print(f"  {len(sequences)} sequences in the reference set.")
 
-    print(f"Loading locked primers from {args.locked} ...")
-    locked_primers = load_validated_primers(args.locked)
-    locked_ids = set(locked_primers.keys())
-    print(f"  {len(locked_primers)} locked amplicons.")
+    print("\nLoading background records (specificity reference)...")
+    all_records, stem_to_ids = parse_background_by_file(args.background)
+    if not all_records:
+        print(f"\nERROR: no records in {args.background}.")
+        return 1
 
-    missing = locked_ids - set(sequences.keys())
-    if missing:
-        print(f"  WARNING: {len(missing)} locked seq_ids have no FASTA in {SEQ_DIR}: "
-              f"{sorted(missing)}")
+    print(f"\nLoading locked panel: {args.locked}")
+    locked = load_locked_panel(args.locked)
+    locked_keys = set(locked.keys())
+    print(f"  {len(locked)} locked amplicons "
+          f"({len({k[0] for k in locked_keys})} isolates).")
 
-    bad_len = {sid for sid, d in locked_primers.items()
-               if len(d['target_barcode']) != args.kmer}
-    if bad_len:
-        print(f"  WARNING: {len(bad_len)} locked barcodes are not {args.kmer} bp. "
-              f"Run with --kmer set to the value used for the locked panel.")
+    # --- Release any amplicons the user wants re-designed ---------------------
+    unlocked = []
+    if args.unlock:
+        for key in load_targets_file(args.unlock):
+            if key in locked:
+                del locked[key]
+                unlocked.append(key)
+            else:
+                print(f"  NOTE: --unlock entry {_fmt(key)} is not in the locked panel")
+        if unlocked:
+            print(f"  Released {len(unlocked)} amplicons for re-design: "
+                  f"{[_fmt(k) for k in unlocked]}")
+            print("  Their previously synthesized primers will NOT appear in the output.")
+        locked_keys = set(locked.keys())
 
-    # --- Which sequences are new? ---
-    if args.new_ids:
-        new_ids = [i for i in load_id_list(args.new_ids) if i in sequences]
+    # --- Targets -------------------------------------------------------------
+    if args.targets:
+        targets = load_targets_file(args.targets)
     else:
-        new_ids = [i for i in sequences if i not in locked_ids]
-    new_sequences = {i: sequences[i] for i in new_ids}
+        targets = [(sid, r) for sid in sorted(target_seqs) for r in REGIONS]
+    targets = list(unlocked) + [t for t in targets if t not in locked_keys]
+    # de-duplicate, preserve order
+    seen = set()
+    targets = [t for t in targets if not (t in seen or seen.add(t))]
 
-    # --- Step A: audit the locked set ---
+    # --- Which records are new? (scopes audit A3) ----------------------------
+    if args.new_isolates:
+        new_seq_ids = [l.strip() for l in open(args.new_isolates)
+                       if l.strip() and not l.startswith("#")]
+    else:
+        new_seq_ids = sorted({sid for sid, _ in targets})
+    new_record_ids = []
+    for sid in new_seq_ids:
+        stem = isolate_stem_for(sid, stem_to_ids)
+        new_record_ids.extend(stem_to_ids.get(stem, []))
+    new_record_ids = sorted(set(new_record_ids))
+
+    # --- Step A: audit -------------------------------------------------------
     if not args.skip_locked_audit:
-        print(f"\nStep A: Auditing locked set against the expanded reference ...")
+        print(f"\nStep A: auditing the locked panel...")
         t0 = timer.perf_counter()
-        report = audit_locked_set(
-            locked_primers, sequences, new_sequences,
+        report = audit_locked_panel(
+            locked, all_records, new_record_ids,
             max_pcr_product=args.max_pcr_product, seed_len=args.seed_len,
             max_mismatches=args.max_mismatches,
             check_locked_pairs=not args.skip_locked_pair_audit,
         )
-        print_audit(report, len(locked_primers), len(new_sequences))
+        print_audit(report, len(locked), len(new_record_ids))
         print(f"  (audit took {timer.perf_counter() - t0:.1f}s)")
-
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        audit_path = os.path.join(OUTPUT_DIR, f"locked_audit_k{args.kmer}.txt")
-        with open(audit_path, 'w') as f:
-            for sid, hits in sorted(report['barcode_collisions'].items()):
-                f.write(f"barcode_not_unique\t{sid}\t"
-                        f"{';'.join(f'{k}:{v}' for k, v in sorted(hits.items()))}\n")
-            for sid in sorted(report['nonspecific']):
-                f.write(f"pair_not_specific\t{sid}\n")
-            for a, b in sorted(report['cross_pairs']):
-                f.write(f"locked_cross_pair\t{a}\t{b}\n")
-        print(f"  Audit written to: {audit_path}")
+        write_audit(report, OUTPUT_DIR, suffix)
 
     if args.mode == "audit":
         return 0
 
-    # --- Target list ---
-    if args.targets:
-        target_ids = load_id_list(args.targets)
-    elif args.mode == "extend":
-        target_ids = sorted(set(sequences.keys()) - locked_ids)
-    else:
-        print("\nERROR: --targets is required in rescue mode.")
-        return 1
-
-    target_ids = [t for t in target_ids if t not in locked_ids]
-    print(f"\n{len(target_ids)} targets to design "
-          f"({'extend' if args.mode == 'extend' else 'rescue'} mode).")
-    if not target_ids:
-        print("Nothing to do.")
+    print(f"\n{len(targets)} targets to design.")
+    if not targets:
+        print("Nothing to do — every isolate/region is already in the locked panel.")
         return 0
 
-    # --- Step 0: candidate generation ---
-    print(f"\nStep 0: Building candidate pools ...")
+    # --- Step 0: candidates --------------------------------------------------
+    print(f"\nStep 0: building candidate pools...")
     t0 = timer.perf_counter()
     existing = load_all_candidate_primers(CANDIDATE_DIR) if args.use_existing_candidates else {}
     new_candidates = {}
     no_candidates = []
-    exhausted_pool = []   # targets whose entire barcode space is sampled every seed
+    exhausted_pool = []
 
-    for seq_id in target_ids:
-        old = existing.get(seq_id, [])
+    for key in targets:
+        seq_id, region = key
+        old = existing.get(key, [])
         fresh = []
         n_barcodes = 0
+
         if not args.no_fresh_candidates:
-            barcodes = load_unique_barcodes(BARCODE_CSV, seq_id)
+            if seq_id not in target_seqs:
+                print(f"  {_fmt(key)}: no chromosome FASTA in {args.only_genome}; skipped")
+                no_candidates.append(key)
+                continue
+            barcodes = load_unique_barcodes(BARCODE_CSV, seq_id, region=region or None)
             n_barcodes = len(barcodes)
             if barcodes:
                 if n_barcodes <= args.num_barcodes:
-                    exhausted_pool.append(seq_id)
+                    exhausted_pool.append(key)
                 fresh = design_candidate_primers(
-                    sequences, seq_id, barcodes, primer_config,
-                    num_of_barcodes_checked=args.num_barcodes,
+                    target_seqs, all_records, seq_id, barcodes,
+                    primer_config, args.num_barcodes,
                 )
             else:
-                print(f"  {seq_id}: no unique barcodes in {BARCODE_CSV}")
+                print(f"  {_fmt(key)}: no unique barcodes in {BARCODE_CSV}")
+
         combined = old + fresh
+        pool = "" if args.no_fresh_candidates else f" (from {n_barcodes} unique barcodes)"
         if combined:
-            new_candidates[seq_id] = combined
-            flag = " [pool exhausted]" if seq_id in exhausted_pool else ""
-            print(f"  {seq_id}: {len(old)} existing + {len(fresh)} fresh = {len(combined)} "
-                  f"(from {n_barcodes} unique barcodes){flag}")
+            new_candidates[key] = combined
+            flag = " [pool exhausted]" if key in exhausted_pool else ""
+            print(f"  {_fmt(key)}: {len(old)} existing + {len(fresh)} fresh "
+                  f"= {len(combined)}{pool}{flag}")
         else:
-            no_candidates.append(seq_id)
-            print(f"  {seq_id}: no candidates (from {n_barcodes} unique barcodes)")
+            no_candidates.append(key)
+            print(f"  {_fmt(key)}: no candidates{pool}")
+
     print(f"  Candidate generation done ({timer.perf_counter() - t0:.1f}s)")
 
     if exhausted_pool:
         print(f"\n  NOTE: {len(exhausted_pool)} targets have <= --num-barcodes "
-              f"({args.num_barcodes}) unique barcodes, so every seed samples their entire "
-              f"barcode space and produces the identical candidate pool:")
-        print(f"    {sorted(exhausted_pool)}")
-        print("  Re-running with more seeds cannot help these. Raise --kmer to create more "
-              "unique barcodes, widen the amplicon size range, or relax the Primer3 limits.")
+              f"({args.num_barcodes}) unique barcodes, so every seed samples their "
+              f"entire barcode space and builds an identical candidate pool:")
+        print(f"    {[_fmt(k) for k in sorted(exhausted_pool)]}")
+        print("  More seeds cannot help these — change the barcode length, widen "
+              "--product-size-range, or relax the Primer3 limits.")
 
     if not new_candidates:
         print("\nNo candidates available. Nothing to add.")
+        save_panel(OUTPUT_DIR, locked, f"added_primers_{suffix}-seed{args.seed}.csv")
         return 0
 
-    # --- Step 1: pre-filter against locked ---
-    print(f"\nStep 1: Pre-filtering against {len(locked_primers)} locked primers ...")
+    # --- Step 1: pre-filter --------------------------------------------------
+    print(f"\nStep 1: pre-filtering against {len(locked)} locked amplicons...")
     t0 = timer.perf_counter()
-    filtered_candidates, prefilter_failed = prefilter_candidates(
-        locked_primers, new_candidates, args.min_hamming
-    )
+    filtered, prefilter_failed = prefilter_candidates(
+        locked, new_candidates, args.min_hamming)
     before = sum(len(v) for v in new_candidates.values())
-    after = sum(len(v) for v in filtered_candidates.values())
-    print(f"  {before} -> {after} candidates compatible with the locked set "
+    after = sum(len(v) for v in filtered.values())
+    print(f"  {before} -> {after} candidates compatible with the locked panel "
           f"({timer.perf_counter() - t0:.1f}s)")
-    print(f"  {len(filtered_candidates)} targets retained, {len(prefilter_failed)} eliminated")
+    print(f"  {len(filtered)} targets retained, {len(prefilter_failed)} eliminated")
 
-    # --- Steps 2-4 ---
-    if filtered_candidates:
-        print(f"\nSteps 2-4: Selection and cross-reactivity "
-              f"({'retry loop' if args.retry else 'single pass'}) ...")
+    # --- Steps 2-4 -----------------------------------------------------------
+    if filtered:
+        print(f"\nSteps 2-4: selection and cross-reactivity "
+              f"({'retry loop' if args.retry else 'single pass'})...")
         accepted, selection_failed, exhausted, still_pending = select_and_validate(
-            filtered_candidates, locked_primers, sequences,
-            args.min_hamming,
+            filtered, locked, all_records, args.min_hamming,
             max_rounds=args.rounds if args.retry else 1,
             max_pcr_product=args.max_pcr_product, seed_len=args.seed_len,
             max_mismatches=args.max_mismatches,
@@ -707,45 +823,44 @@ def main(argv):
     else:
         accepted, selection_failed, exhausted, still_pending = {}, set(), set(), set()
 
-    # --- Merge and save ---
-    merged = {**locked_primers, **accepted}
+    # --- Merge and save ------------------------------------------------------
+    merged = {**locked, **accepted}
     still_failed = (set(no_candidates) | set(prefilter_failed) |
-                    selection_failed | exhausted | still_pending) - set(accepted.keys())
+                    selection_failed | exhausted | still_pending) - set(accepted)
 
-    print(f"\n--- SUMMARY ({args.mode}, seed {args.seed}) ---")
-    print(f"  Locked (unchanged):  {len(locked_primers)}")
+    print(f"\n--- SUMMARY (seed {args.seed}) ---")
+    print(f"  Locked (unchanged):  {len(locked)}")
     print(f"  Newly designed:      {len(accepted)}")
     print(f"  Final panel size:    {len(merged)}")
     print(f"  Unresolved targets:  {len(still_failed)}")
 
-    prefix = "extended" if args.mode == "extend" else "rescued"
-    output_filename = f"{prefix}_primers_k{args.kmer}-seed{args.seed}.csv"
-    save_primer_results(OUTPUT_DIR, merged, filename=output_filename)
-
+    save_panel(OUTPUT_DIR, merged, f"added_primers_{suffix}-seed{args.seed}.csv")
     if accepted:
-        save_primer_results(OUTPUT_DIR, accepted,
-                            filename=f"{prefix}_primers_NEW_ONLY_k{args.kmer}-seed{args.seed}.csv")
+        save_panel(OUTPUT_DIR, accepted,
+                   f"added_primers_NEW_ONLY_{suffix}-seed{args.seed}.csv")
 
     if still_failed:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        failed_path = os.path.join(OUTPUT_DIR, f"still_failed_k{args.kmer}-seed{args.seed}.txt")
-        with open(failed_path, 'w') as f:
-            for sid in sorted(still_failed):
-                f.write(sid + "\n")
-        print(f"  Unresolved target IDs: {failed_path}")
+        path = os.path.join(OUTPUT_DIR, f"still_failed_{suffix}-seed{args.seed}.txt")
+        with open(path, "w") as f:
+            for seq_id, region in sorted(still_failed):
+                f.write(f"{seq_id},{region}\n")
+        print(f"  Unresolved targets -> {path}")
 
         print("\n--- FAILURE BREAKDOWN ---")
         if no_candidates:
-            print(f"  No candidates at all ({len(no_candidates)}): {sorted(no_candidates)}")
+            print(f"  No candidates at all ({len(no_candidates)}): "
+                  f"{[_fmt(k) for k in sorted(no_candidates)]}")
         if prefilter_failed:
-            print(f"  Incompatible with locked set ({len(prefilter_failed)}): {sorted(prefilter_failed)}")
+            print(f"  Incompatible with locked panel ({len(prefilter_failed)}): "
+                  f"{[_fmt(k) for k in sorted(prefilter_failed)]}")
         sel = sorted(selection_failed - exhausted)
         if sel:
-            print(f"  Mutually incompatible among new targets ({len(sel)}): {sel}")
+            print(f"  Mutually incompatible among new targets ({len(sel)}): "
+                  f"{[_fmt(k) for k in sel]}")
         if exhausted:
-            print(f"  Cross-reactivity, candidates exhausted ({len(exhausted)}): {sorted(exhausted)}")
-        if still_pending - exhausted - selection_failed:
-            print(f"  Round limit reached: {sorted(still_pending - exhausted - selection_failed)}")
+            print(f"  Cross-reactivity, candidates exhausted ({len(exhausted)}): "
+                  f"{[_fmt(k) for k in sorted(exhausted)]}")
 
     print("\n--- COMPLETE ---")
     return 0
