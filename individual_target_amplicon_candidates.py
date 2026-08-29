@@ -1,5 +1,9 @@
 """
 Find candidate amplicons and primers for each sequence.
+
+Usage (called from SLURM array script):
+    python individual_target_amplicon_candidates.py \\
+        <RANGES_CSV> <ONLY_GENOME_DIR> <BACKGROUND_DIR> <SEQ_ID> <BARCODE_LENGTH>
 """
 
 import sys
