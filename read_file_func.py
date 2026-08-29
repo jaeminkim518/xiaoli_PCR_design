@@ -12,9 +12,7 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 
 
-# ---------------------------------------------------------------------------
-# FASTA discovery and parsing
-# ---------------------------------------------------------------------------
+### FASTA discovery and parsing
 
 def find_fasta_files(input_dir, pattern=None):
     """
@@ -133,9 +131,8 @@ def parse_all_records_except(directory: str, exclude_prefix: str) -> dict[str, s
     return records_dict
 
 
-# ---------------------------------------------------------------------------
-# Barcode CSV  (output of kmer_generation.py)
-# ---------------------------------------------------------------------------
+
+### Barcode CSV  (output of kmer_generation.py)
 
 def load_unique_barcodes(csv_path: str, seq_id: str,
                          region: str | None = None) -> list[tuple[str, int]]:
@@ -143,16 +140,11 @@ def load_unique_barcodes(csv_path: str, seq_id: str,
     Load barcode candidates for a specific seq_id from the kmer_generation
     output CSV (which may contain barcodes of multiple lengths).
 
-    Args:
-        csv_path: path to unique_barcodes_k<MIN>_<MAX>.csv
-        seq_id:   the isolate seq_id (e.g. 'KL13_1'), must match Seq_ID column
-        region:   optional filter — 'Ori', 'Ter', or None to load both
-
     Returns:
         [(barcode_sequence, position_0based), ...]  sorted by position.
         Barcodes of all lengths within the file are included; the primer
         design stage handles variable-length barcodes correctly.
-        Position is 0-based chromosomal coordinate (Python convention).
+        Position is 0-based chromosomal coordinate.
     """
     barcodes = []
     with open(csv_path, "r", newline="") as f:
@@ -166,9 +158,7 @@ def load_unique_barcodes(csv_path: str, seq_id: str,
     return sorted(barcodes, key=lambda x: x[1])
 
 
-# ---------------------------------------------------------------------------
-# Ranges CSV  (barcode_ranges_in_genome.csv)
-# ---------------------------------------------------------------------------
+### Ranges CSV  (barcode_ranges_in_genome.csv)
 
 def parse_ranges_csv(csv_path: str) -> list[dict]:
     """
@@ -186,9 +176,7 @@ def parse_ranges_csv(csv_path: str) -> list[dict]:
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Candidate primer CSVs  (output of individual_target_amplicon_candidates.py)
-# ---------------------------------------------------------------------------
+### Candidate primer CSVs  (output of individual_target_amplicon_candidates.py)
 
 def load_candidate_primers(csv_path: str) -> dict:
     """
