@@ -2,35 +2,14 @@
 Find unique barcode k-mers within the Ori and Ter regions of each strain's
 chromosome, verified unique against every genome and plasmid in the dataset.
 
-Algorithm:
-  Phase 1 — collect all candidate k-mers that slide across the Ori/Ter
-             segments of every isolate.  Each interval in a wrapped Ori range
-             (e.g. "6666100 - 7010776 and 0 - 356401") is treated as an
-             independent segment (linear).
-  Phase 2 — count how many times each candidate appears (canonical form =
-             lexicographic min of forward and RC) across ALL sequence records
-             in the background directory (genome + plasmids for all isolates).
-             Candidates with count == 1 are guaranteed unique dataset-wide.
-
-  The two phases are run once per barcode length in the requested range.
-  Background sequences are loaded once and reused across all lengths.
-
 Usage:
     python kmer_generation.py <RANGES_CSV> <ONLY_GENOME_DIR> \\
                                <BACKGROUND_DIR> <MIN_LENGTH> <MAX_LENGTH>
-
-    RANGES_CSV      – barcode_ranges_in_genome.csv
-    ONLY_GENOME_DIR – folder of chromosome-only FASTA files (only_genome/)
-    BACKGROUND_DIR  – folder of genome+plasmid FASTA files
-                      (genome_and_plasmids_within_host/)
-    MIN_LENGTH      – minimum barcode length in bp (e.g. 20)
-    MAX_LENGTH      – maximum barcode length in bp (e.g. 40) [you can match MIN_LENGTH and MAX_LENGTH for specific barcode length]
 
 Output:
     ./output/KMERS/unique_barcodes_k<MIN>_<MAX>.csv  — all lengths combined
     Columns: Seq_ID, Region, Segment, Barcode_Sequence,
              Position, GC_Percent, Barcode_Length
-    Position is 0-based (Python convention), matching downstream scripts.
 """
 
 import sys
@@ -45,10 +24,7 @@ from Bio.Seq import Seq
 
 from read_file_func import parse_ranges_csv, find_fasta_files, parse_sequences
 
-
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
+### Helper functions
 
 def _rc(seq: str) -> str:
     return str(Seq(seq).reverse_complement())
@@ -64,7 +40,7 @@ def parse_range_str(range_str: str) -> list[tuple[int, int]]:
     """
     Parse a range string into a list of (start_1based, end_1based) tuples.
     Handles single intervals and 'and'-joined wrapped intervals.
-    Returns each interval separately — do NOT concatenate.
+    Returns each interval separately.
     """
     parts = re.split(r'\band\b', range_str, flags=re.IGNORECASE)
     intervals = []
@@ -94,9 +70,8 @@ def extract_segments(
     return segments
 
 
-# ---------------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------------
+
+### Core logic
 
 def find_region_unique_barcodes(
     ranges_rows: list[dict],
@@ -111,10 +86,7 @@ def find_region_unique_barcodes(
         entry keys: region, segment, barcode, position (0-based), gc_percent
     """
 
-    # ------------------------------------------------------------------
-    # Phase 1 – slide over Ori/Ter segments and collect candidates
-    # canonical_kmer → [(seq_id, region, seg_label, pos_0based, original_kmer)]
-    # ------------------------------------------------------------------
+    # Slide over Ori/Ter segments and collect candidates
     print(f"\n[Phase 1] Collecting candidates from Ori/Ter segments (k={kmer_size})...")
     candidate_info: dict[str, list] = defaultdict(list)
 
@@ -154,10 +126,7 @@ def find_region_unique_barcodes(
     candidate_set = set(candidate_info.keys())
     print(f"  {len(candidate_set):,} unique canonical candidates collected.")
 
-    # ------------------------------------------------------------------
-    # Phase 2 – count occurrences of candidates in ALL background seqs
-    # (includes all chromosomes and all plasmids for all isolates)
-    # ------------------------------------------------------------------
+    # Count occurrences of candidates in ALL background seqs
     print(f"[Phase 2] Counting across {len(all_background_seqs)} background records...")
     occurrence: Counter = Counter()
 
@@ -171,9 +140,7 @@ def find_region_unique_barcodes(
             if can in candidate_set:
                 occurrence[can] += 1
 
-    # ------------------------------------------------------------------
-    # Phase 3 – keep only count == 1 (unique across the entire dataset)
-    # ------------------------------------------------------------------
+    # Keep only count == 1 (unique across the entire dataset)
     unique_barcodes: dict = defaultdict(lambda: defaultdict(list))
 
     for can, cnt in occurrence.items():
@@ -214,10 +181,6 @@ def append_unique_barcodes(
     return total
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     if len(sys.argv) < 5:
         print("Usage: python kmer_generation.py <RANGES_CSV> <ONLY_GENOME_DIR> "
@@ -237,15 +200,15 @@ if __name__ == "__main__":
 
     t0 = timer.perf_counter()
 
-    # ── Ranges CSV ───────────────────────────────────────────────────────
+    # Ranges CSV
     ranges_rows = parse_ranges_csv(RANGES_CSV)
     print(f"Loaded {len(ranges_rows)} isolates from {RANGES_CSV}.")
 
-    # ── Chromosomal sequences (only_genome) ──────────────────────────────
+    # Chromosomal sequences (only_genome)
     genome_seqs_raw = parse_sequences(find_fasta_files(ONLY_GENOME_DIR))
     genome_seqs     = {sid: str(seq).upper() for sid, seq in genome_seqs_raw.items()}
 
-    # Map CSV isolate name → seq_id (filename stem), e.g. "KL13" → "KL13_1"
+    # Map CSV isolate name → seq_id (filename stem)
     isolate_to_seq_id: dict[str, str] = {}
     for row in ranges_rows:
         isolate = row['isolate']
@@ -259,8 +222,7 @@ if __name__ == "__main__":
             else:
                 print(f"  [WARN] No genome file found for isolate '{isolate}'")
 
-    # ── Background: ALL records from genome_and_plasmids dir ─────────────
-    # Loaded once; reused for every barcode length to avoid redundant I/O.
+    # Background: ALL records from genome_and_plasmids dir
     print(f"\nLoading background sequences from: {BACKGROUND_DIR}")
     bg_dir   = Path(BACKGROUND_DIR)
     bg_files = sorted(
@@ -273,7 +235,7 @@ if __name__ == "__main__":
             all_background_seqs.append(str(rec.seq).upper())
     print(f"  {len(all_background_seqs)} records from {len(bg_files)} files.")
 
-    # ── Loop over every barcode length in [MIN_LENGTH, MAX_LENGTH] ────────
+    # Loop over every barcode length in [MIN_LENGTH, MAX_LENGTH]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     output_path  = os.path.join(OUTPUT_DIR, output_filename)
     grand_total  = 0
