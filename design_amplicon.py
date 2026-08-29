@@ -26,7 +26,7 @@ from read_file_func import (
 from sequence_alignment import is_primer_pair_specific
 
 def calculate_hamming_distance(s1, s2):
-    """Calculates the Hamming distance between two equal-length strings."""
+    """Returns Hamming distance for equal-length strings, or None if lengths differ."""
     if len(s1) != len(s2):
         return None
     return sum(c1 != c2 for c1, c2 in zip(s1, s2))
