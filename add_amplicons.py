@@ -1,58 +1,5 @@
 """
 Add amplicons to an existing panel, keeping already-designed primers fixed.
-
-Use this when part of the panel must not change:
-  - new isolates joined the community and their primers still need designing
-  - a Stage 3 run left some (strain, region) targets without an amplicon
-
-Everything in the locked CSV is reproduced verbatim in the output. Only the
-targets you ask for are designed, and they are designed to be compatible with
-the locked set.
-
-Pipeline
---------
-  Step A   Audit the locked panel against the current reference set.
-           Stages 1-3 guarantee uniqueness and specificity only against the
-           FASTAs present when they ran, so adding isolates can retroactively
-           break an already-synthesized amplicon. Three checks:
-             A1  each locked barcode still occurs exactly once, in its own
-                 chromosome record
-             A2  each locked primer pair still amplifies only its own target
-             A3  two locked primer pairs do not cross-amplify on a newly
-                 added record
-           Findings are reported, never repaired — the oligos already exist,
-           so what to do about a broken amplicon is your call.
-  Step 0   Design fresh primer candidates for each target (Primer3 + specificity),
-           region by region, sampling from the Stage 1 barcode CSV.
-  Step 1   Drop candidates incompatible with the locked set (barcode Hamming
-           distance + cross-dimer).
-  Step 2   Weighted joint selection among the new targets.
-  Step 2.5 Re-verify own-target specificity of each selection against the full
-           current reference (catches stale Stage 2 candidate CSVs).
-  Step 3   Cross-reactivity: new-vs-locked and new-vs-new.
-  Step 4   Greedy conflict resolution. Locked targets are never removed.
-
-Targets are (Seq_ID, Region) pairs, matching the keys used in Stage 3, e.g.
-("KL30_1", "Ori"). Seq_ID is the only_genome filename stem and is also the
-chromosome's record id inside the corresponding genome_and_plasmids file.
-
-Usage
------
-  # add every isolate that is not already in the locked panel
-  python add_amplicons.py \
-      --locked ./output/barcodes_k20_amplicon_design/validated_primers_k20-seed7.csv \
-      --only-genome ./only_genome \
-      --background ./genome_and_plasmids_within_host \
-      --length 20 --seed 1
-
-  # audit only: did the new isolates break the existing panel?
-  python add_amplicons.py --mode audit --locked <csv> \
-      --only-genome ./only_genome --background ./genome_and_plasmids_within_host \
-      --length 20
-
-  # design only specific targets
-  printf 'KL30_1,Ori\nKL30_1,Ter\nKL13_1,Ter\n' > targets.txt
-  python add_amplicons.py --locked <csv> --targets targets.txt ...
 """
 
 import argparse
@@ -88,10 +35,6 @@ from sequence_alignment import is_primer_pair_specific
 
 REGIONS = ("Ori", "Ter")
 
-
-# ---------------------------------------------------------------------------
-# I/O
-# ---------------------------------------------------------------------------
 
 def load_locked_panel(csv_path):
     """
@@ -144,7 +87,7 @@ def save_panel(output_dir, primers, filename):
 def load_targets_file(txt_path):
     """
     One target per line. Either 'SEQ_ID,Region' or bare 'SEQ_ID'
-    (which expands to both regions). '#' starts a comment.
+    (which expands to both regions).
     """
     targets = []
     with open(txt_path) as f:
@@ -161,17 +104,6 @@ def load_targets_file(txt_path):
 
 
 def parse_background_by_file(directory):
-    """
-    Load every record from every FASTA in `directory`, keeping track of which
-    file each record came from.
-
-    Returns (all_records, stem_to_record_ids):
-        all_records        {record_id: sequence_str}
-        stem_to_record_ids {filename_stem: [record_id, ...]}
-
-    Equivalent to read_file_func.parse_all_records_from_dir() but retains the
-    file grouping, which is what lets the audit tell new records from old ones.
-    """
     all_records = {}
     stem_to_ids = {}
     dir_path = Path(directory)
@@ -193,7 +125,6 @@ def parse_background_by_file(directory):
 def isolate_stem_for(seq_id, stem_to_ids):
     """
     Find the genome_and_plasmids file that contains a given chromosome record.
-    Falls back to stripping a trailing '_<digits>' (KL13_1 -> KL13).
     """
     for stem, ids in stem_to_ids.items():
         if seq_id in ids:
@@ -201,26 +132,18 @@ def isolate_stem_for(seq_id, stem_to_ids):
     return re.sub(r"_\d+$", "", seq_id)
 
 
-# ---------------------------------------------------------------------------
-# Barcode distance
-# ---------------------------------------------------------------------------
-
+### Barcode Distance
 def barcodes_too_close(bc_a, bc_b, min_hamming_distance):
     """
     True if two barcodes are closer than min_hamming_distance.
-    calculate_hamming_distance returns None for unequal lengths, which means
-    'no constraint' — different-length barcodes are inherently distinguishable.
     """
     dist = calculate_hamming_distance(bc_a, bc_b)
     return dist is not None and dist < min_hamming_distance
 
 
-# ---------------------------------------------------------------------------
-# Step A — audit the locked panel
-# ---------------------------------------------------------------------------
-
+### Locked panel audit
 def count_motif_occurrences(sequences, motif):
-    """Count motif + reverse complement hits per record (linear, as in Stage 1)."""
+    """Count motif + reverse complement hits per record."""
     motif = motif.upper()
     rc = str(Seq(motif).reverse_complement()).upper()
     hits = {}
@@ -240,18 +163,16 @@ def audit_locked_panel(locked, all_records, new_record_ids,
     """
     Returns {'unmapped': [...], 'barcode_collisions': {...},
              'nonspecific': [...], 'cross_pairs': [...]}
-    Keys of `locked` are (seq_id, region); seq_id must be a record id in
-    all_records, otherwise the own-target amplicon cannot be excluded.
     """
     report = {"unmapped": [], "barcode_collisions": {}, "nonspecific": [],
               "cross_pairs": []}
 
-    # A0 — every locked Seq_ID must resolve to a record, or A1/A2 are meaningless
+    # A0 - every locked Seq_ID must resolve to a record
     for (seq_id, region) in locked:
         if seq_id not in all_records:
             report["unmapped"].append((seq_id, region))
 
-    # A1 — barcode still occurs exactly once, in its own chromosome record
+    # A1 — barcode still occurs exactly once
     for (seq_id, region), data in locked.items():
         hits = count_motif_occurrences(all_records, data["target_barcode"])
         total = sum(hits.values())
@@ -262,7 +183,7 @@ def audit_locked_panel(locked, all_records, new_record_ids,
     # A2 — pair still amplifies only its own target
     for (seq_id, region), data in locked.items():
         if seq_id not in all_records:
-            continue  # already reported as unmapped; would be a false positive
+            continue 
         if not is_primer_pair_specific(
             data["fwd_primer"], data["rev_primer"], seq_id, all_records,
             max_pcr_product=max_pcr_product, seed_len=seed_len,
@@ -270,9 +191,7 @@ def audit_locked_panel(locked, all_records, new_record_ids,
         ):
             report["nonspecific"].append((seq_id, region))
 
-    # A3 — locked x locked, searched on the NEW records only. Locked pairs were
-    # already cleared against the old records in Stage 3, so restricting the
-    # search space keeps this O(n^2) check affordable.
+    # A3 — locked x locked, searched on the new records only.
     if check_locked_pairs and new_record_ids:
         new_records = {r: all_records[r] for r in new_record_ids if r in all_records}
         items = list(locked.items())
@@ -367,9 +286,8 @@ def write_audit(report, output_dir, suffix):
     return path
 
 
-# ---------------------------------------------------------------------------
-# Step 1 — pre-filter against the locked panel
-# ---------------------------------------------------------------------------
+
+### Pre-filter against the locked panel
 
 def prefilter_candidates(locked, new_candidates, min_hamming_distance):
     """Keep only candidates compatible with every locked amplicon."""
@@ -401,9 +319,7 @@ def prefilter_candidates(locked, new_candidates, min_hamming_distance):
     return filtered, prefilter_failed
 
 
-# ---------------------------------------------------------------------------
-# Step 3 — cross-reactivity (locked-vs-locked is Step A3's job)
-# ---------------------------------------------------------------------------
+### Cross-reactivity check
 
 def check_cross_reactivity_new(locked, new_primers, all_records,
                                max_pcr_product=300, seed_len=9, max_mismatches=2):
@@ -474,18 +390,10 @@ def resolve_conflicts_locked_safe(problematic_pairs, locked_keys, candidate_coun
     return failed
 
 
-# ---------------------------------------------------------------------------
-# Steps 2-4
-# ---------------------------------------------------------------------------
-
 def select_and_validate(filtered_candidates, locked, all_records, min_hamming_dist,
                         max_rounds=1, max_pcr_product=300, seed_len=9,
                         max_mismatches=2):
-    """
-    Joint selection followed by cross-reactivity.
-    max_rounds=1 is a single pass; >1 blacklists the failing candidate and retries.
-    Returns (accepted, selection_failed, exhausted, still_pending).
-    """
+    """Joint selection followed by cross-reactivity."""
     accepted = {}
     current = {k: list(v) for k, v in filtered_candidates.items()}
     selection_failed = set()
@@ -509,7 +417,7 @@ def select_and_validate(filtered_candidates, locked, all_records, min_hamming_di
         if not selection:
             break
 
-        # Step 2.5 — own-target specificity against the current reference
+        # Own-target specificity against the current reference
         stale = []
         for key, data in list(selection.items()):
             seq_id, _ = key
@@ -584,10 +492,6 @@ def select_and_validate(filtered_candidates, locked, all_records, min_hamming_di
 
     return accepted, (selection_failed - set(accepted.keys())), exhausted, set(current.keys())
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args(argv):
     p = argparse.ArgumentParser(
@@ -664,7 +568,7 @@ def main(argv):
         },
     }
 
-    # --- Reference sequences -------------------------------------------------
+    ### Reference Sequences
     print("Loading chromosome templates...")
     target_seqs = parse_sequences(find_fasta_files(args.only_genome))
     if not target_seqs:
@@ -683,7 +587,7 @@ def main(argv):
     print(f"  {len(locked)} locked amplicons "
           f"({len({k[0] for k in locked_keys})} isolates).")
 
-    # --- Release any amplicons the user wants re-designed ---------------------
+    ### Release amplicons for redesign
     unlocked = []
     if args.unlock:
         for key in load_targets_file(args.unlock):
@@ -698,7 +602,6 @@ def main(argv):
             print("  Their previously synthesized primers will NOT appear in the output.")
         locked_keys = set(locked.keys())
 
-    # --- Targets -------------------------------------------------------------
     if args.targets:
         targets = load_targets_file(args.targets)
     else:
@@ -708,7 +611,6 @@ def main(argv):
     seen = set()
     targets = [t for t in targets if not (t in seen or seen.add(t))]
 
-    # --- Which records are new? (scopes audit A3) ----------------------------
     if args.new_isolates:
         new_seq_ids = [l.strip() for l in open(args.new_isolates)
                        if l.strip() and not l.startswith("#")]
@@ -720,7 +622,7 @@ def main(argv):
         new_record_ids.extend(stem_to_ids.get(stem, []))
     new_record_ids = sorted(set(new_record_ids))
 
-    # --- Step A: audit -------------------------------------------------------
+    # Audit
     if not args.skip_locked_audit:
         print(f"\nStep A: auditing the locked panel...")
         t0 = timer.perf_counter()
@@ -742,7 +644,7 @@ def main(argv):
         print("Nothing to do — every isolate/region is already in the locked panel.")
         return 0
 
-    # --- Step 0: candidates --------------------------------------------------
+    # Builds Candidates
     print(f"\nStep 0: building candidate pools...")
     t0 = timer.perf_counter()
     existing = load_all_candidate_primers(CANDIDATE_DIR) if args.use_existing_candidates else {}
@@ -799,7 +701,7 @@ def main(argv):
         save_panel(OUTPUT_DIR, locked, f"added_primers_{suffix}-seed{args.seed}.csv")
         return 0
 
-    # --- Step 1: pre-filter --------------------------------------------------
+    # Pre-filter
     print(f"\nStep 1: pre-filtering against {len(locked)} locked amplicons...")
     t0 = timer.perf_counter()
     filtered, prefilter_failed = prefilter_candidates(
@@ -810,7 +712,6 @@ def main(argv):
           f"({timer.perf_counter() - t0:.1f}s)")
     print(f"  {len(filtered)} targets retained, {len(prefilter_failed)} eliminated")
 
-    # --- Steps 2-4 -----------------------------------------------------------
     if filtered:
         print(f"\nSteps 2-4: selection and cross-reactivity "
               f"({'retry loop' if args.retry else 'single pass'})...")
@@ -823,7 +724,6 @@ def main(argv):
     else:
         accepted, selection_failed, exhausted, still_pending = {}, set(), set(), set()
 
-    # --- Merge and save ------------------------------------------------------
     merged = {**locked, **accepted}
     still_failed = (set(no_candidates) | set(prefilter_failed) |
                     selection_failed | exhausted | still_pending) - set(accepted)
