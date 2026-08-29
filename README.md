@@ -2,7 +2,7 @@
 
 Authors: Jaemin Kim, Zhengqing Zhou. (Duke University)
 
-Find a unique 20 bp sequence within each strain's Ori and Ter regions, then design and validate PCR primers around each one so all 36 amplicons can be distinguished from each other and amplified together in a single multiplex reaction without cross-reacting.
+Find a unique 20 bp sequence within each strain's Ori and Ter regions, then design and validate PCR primers around each one so all 36 amplicons can be distinguished from each other and amplified together in a single multiplex reaction without cross-reactions.
 
 ---
 
@@ -49,7 +49,7 @@ Stages 2 and 3 are parallelized via SLURM array jobs.
 
 Stage 4 is optional. Run it after a part of the panel is already fixed - if new isolates need adding, or if a Stage 3 run left some targets without an amplicon.
 
-### Stage 1 — Find unique barcodes *(run directly on compute node, ~5–30 min)*
+### Stage 1: Find unique barcodes
 
 Get an interactive compute node:
 ```bash
@@ -71,11 +71,11 @@ python kmer_generation.py \
 Output: `./output/KMERS/unique_barcodes_k20.csv`
 
 This file contains all unique 20 bp barcode candidates for every strain's
-Ori and Ter regions, verified unique against all 18 genomes and all plasmids.
+Ori and Ter regions, unique against all genomes and all plasmids.
 
 ---
 
-### Stage 2 — Design primer candidates *(SLURM array, one job per isolate)*
+### Stage 2: Design primer candidates
 
 Before submitting, check the number of isolates and confirm the `--array`
 bound in `candidates.sh` matches (0 to N-1):
@@ -105,7 +105,7 @@ Do NOT proceed to Stage 3 until all Stage 2 jobs are finished.
 
 ---
 
-### Stage 3 — Select optimal multiplex combination *(SLURM array, one job per seed)*
+### Stage 3: Select optimal multiplex combination
 
 ```bash
 sbatch design_array.sh
@@ -126,35 +126,34 @@ Each output file contains up to 36 primer pairs (18 Ori + 18 Ter) that:
 
 ---
 
-### Selecting the best result
+### Select the best result
 
 Find the seed with the most amplicons:
 ```bash
 wc -l ./output/barcodes_k20_amplicon_design/*.csv
 ```
-The file with the most lines (subtract 1 for the header) is your best result.
+The file with the most lines (subtract 1 for the header) is the best result.
 A perfect run yields 37 lines (36 amplicons + 1 header).
 
 ---
 
-### Stage 4 — Add amplicons to an existing panel *(optional)*
+### Stage 4: Add amplicons to an existing panel
 
-Everything in the locked CSV is copied to the output verbatim; only the targets
-you ask for are designed, and they are designed to be compatible with what is
-already there. Targets are `(Seq_ID, Region)` pairs, the same keys Stage 3 uses.
+Everything in the locked CSV is copied to the output, and only the targets
+specified are designed, with compatibility with what is
+already there. Targets are `(Seq_ID, Region)` pairs.
 
 #### Adding new isolates
 
-**1. Add the new isolates to the existing directories.** No new directories.
+**1. Add the new isolates to the existing directories.**
 
 ```bash
 cp KL30_1.fasta ./only_genome/                        # chromosome only
 cp KL30.fasta   ./genome_and_plasmids_within_host/    # chromosome + plasmids
 ```
 
-The chromosome appears in both directories, which is intended: `only_genome/`
-supplies the primer-design template, `genome_and_plasmids_within_host/` is the
-off-target reference. The `only_genome` filename stem (`KL30_1`) becomes the
+`only_genome/` supplies the primer-design template and `genome_and_plasmids_within_host/` 
+is the off-target reference. The `only_genome` filename stem (`KL30_1`) is the
 `Seq_ID` used downstream and must match the chromosome's FASTA record id.
 
 Then add a row for the new isolate to `barcode_ranges_in_genome.csv`, giving the
@@ -165,8 +164,8 @@ isolate,Ori_5%_Range,Ter_5%_Range
 KL30,1 - 250000,2400000 - 2650000
 ```
 
-The `isolate` column is `KL30`, not `KL30_1` — Stage 1 maps it to the file by
-prefix. A window that wraps the origin is written as two intervals joined by
+The `isolate` column is `KL30`, not `KL30_1` - important as Stage 1 maps it to the file 
+by prefix. A window that wraps the origin is written as two intervals joined by
 `and`, e.g. `6666100 - 7010776 and 0 - 356401`. Without this row Stage 1 skips
 the isolate and finds no barcodes for it.
 
@@ -231,11 +230,10 @@ printf 'KL1_1,Ter\n' > unlock.txt
 python add_amplicons.py --locked <csv> --length 20 --seed 1 --unlock unlock.txt
 ```
 
-#### What the audit checks
+#### Audit checking
 
 Stages 1–3 guarantee uniqueness and specificity only against the reference set
-as it stood when they ran. Adding isolates can break three things, none of which
-Stages 1–3 re-check:
+as it stood when they ran. Adding isolates can break three things:
 
 - **A1** — a locked barcode now also occurs in a new isolate's genome or plasmid
 - **A2** — a locked primer pair now amplifies a new record off-target
@@ -276,16 +274,13 @@ diff /tmp/old.txt /tmp/new.txt && echo "locked panel unchanged"
 
 - Step 0 designs fresh candidates with Primer3 and re-checks specificity against
   the current reference, so **do not** reuse Stage 2 CSVs written before the new
-  isolates were added — they were validated against the smaller set.
-  `--use-existing-candidates` is opt-in for exactly that reason.
+  isolates were added as they were validated against the smaller set.
+  `--use-existing-candidates` is optional for that reason.
 - Each seed samples `--num-barcodes` (default 100) barcodes per target, so
   different seeds explore different candidate pools. When a target has fewer
   unique barcodes than that, every seed uses all of them and the pool is
   identical; Step 0 flags these as `[pool exhausted]`, meaning more seeds cannot
   help and the barcode length or size range has to change instead.
-- `--retry` re-runs selection for up to 10 rounds, blacklisting the candidate
-  that failed cross-reactivity. It costs roughly 6x the runtime and rarely
-  changes the outcome — prefer more seeds with the default single pass.
 
 ---
 
