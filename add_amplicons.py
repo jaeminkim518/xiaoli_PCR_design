@@ -1,5 +1,23 @@
 """
 Add amplicons to an existing panel, keeping already-designed primers fixed.
+
+Usage
+-----
+  # add every isolate that is not already in the locked panel
+  python add_amplicons.py \
+      --locked ./output/barcodes_k20_amplicon_design/validated_primers_k20-seed7.csv \
+      --only-genome ./only_genome \
+      --background ./genome_and_plasmids_within_host \
+      --length 20 --seed 1
+
+  # audit only: did the new isolates break the existing panel?
+  python add_amplicons.py --mode audit --locked <csv> \
+      --only-genome ./only_genome --background ./genome_and_plasmids_within_host \
+      --length 20
+
+  # design only specific targets
+  printf 'KL30_1,Ori\nKL30_1,Ter\nKL13_1,Ter\n' > targets.txt
+  python add_amplicons.py --locked <csv> --targets targets.txt ...
 """
 
 import argparse
@@ -393,7 +411,11 @@ def resolve_conflicts_locked_safe(problematic_pairs, locked_keys, candidate_coun
 def select_and_validate(filtered_candidates, locked, all_records, min_hamming_dist,
                         max_rounds=1, max_pcr_product=300, seed_len=9,
                         max_mismatches=2):
-    """Joint selection followed by cross-reactivity."""
+    """
+    Joint selection followed by cross-reactivity.
+
+    Returns (accepted, selection_failed, exhausted, still_pending).
+    """
     accepted = {}
     current = {k: list(v) for k, v in filtered_candidates.items()}
     selection_failed = set()
