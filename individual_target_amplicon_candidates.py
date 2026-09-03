@@ -1,9 +1,26 @@
 """
 Find candidate amplicons and primers for each sequence.
 
+Changes from the original version:
+  - Sequences come from two directories:
+      only_genome/          — chromosome-only FASTA (one per isolate), used as
+                              the template for primer design.
+      genome_and_plasmids/  — genome + plasmid FASTA for every OTHER isolate,
+                              used as the off-target background for specificity
+                              checks (so primers that also amplify any other
+                              strain's genome or plasmid are rejected).
+  - Barcodes are loaded from the region-aware kmer_generation output CSV,
+    which stores 0-based chromosomal positions and tags each barcode with its
+    Ori/Ter region and segment.
+  - PRODUCT_SIZE_RANGE is widened to accommodate 40-50 bp barcodes.
+
 Usage (called from SLURM array script):
     python individual_target_amplicon_candidates.py \\
         <RANGES_CSV> <ONLY_GENOME_DIR> <BACKGROUND_DIR> <SEQ_ID> <BARCODE_LENGTH>
+
+    SEQ_ID         – isolate seq_id matching the Seq_ID column in the barcode
+                     CSV (e.g. 'KL13_1'), derived from the only_genome filename
+    BARCODE_LENGTH – integer barcode length used in kmer_generation.py
 """
 
 import sys
@@ -25,7 +42,10 @@ from read_file_func import (
 from sequence_alignment import is_primer_pair_specific
 
 
-### Primer Design
+# ---------------------------------------------------------------------------
+# Primer design
+# ---------------------------------------------------------------------------
+
 def design_candidate_primers(
     target_seqs: dict,           # {SEQ_ID: chrom_seq}   — template source
     specificity_seqs: dict,      # {any_id: seq_str}      — off-target check
@@ -37,6 +57,15 @@ def design_candidate_primers(
     """
     Design primer pairs that flank each candidate barcode within the target
     chromosome and are verified not to amplify anywhere in specificity_seqs.
+
+    Args:
+        target_seqs:         {seq_id: chrom_seq}  — only the target chromosome
+        specificity_seqs:    combined dict of target + all off-target sequences,
+                             passed directly to is_primer_pair_specific()
+        seq_id:              identifier for the target sequence
+        barcodes:            [(barcode_str, position_0based), ...]
+        primer_config:       dict with 'flank_size' and 'primer3_globals'
+        num_of_barcodes_checked: max barcodes to try (random sample if more)
     """
     candidates    = []
     target_seq    = str(target_seqs[seq_id])
@@ -55,10 +84,14 @@ def design_candidate_primers(
         sequence_template        = target_seq[template_start:template_end]
         target_start_in_template = position - template_start
 
+        overlap = len(barcode) // 3   # 对20bp → 6
         primer3_results = primer3.design_primers(
             seq_args={
                 'SEQUENCE_TEMPLATE': sequence_template,
-                'SEQUENCE_TARGET':   [target_start_in_template, len(barcode)],
+                'SEQUENCE_TARGET': [
+                    target_start_in_template + overlap,
+                    len(barcode) - 2 * overlap
+                ],
             },
             global_args=primer_config['primer3_globals'],
         )
@@ -110,6 +143,10 @@ def save_candidate_primers(seq_id: str, candidates: list, output_dir: str, filen
     print(f"Saved {len(candidates)} candidates for {seq_id} → {output_path}")
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     np.random.seed(42)
 
@@ -129,23 +166,28 @@ if __name__ == "__main__":
     BARCODE_CSV = f"./output/KMERS/unique_barcodes_{barcode_suffix}.csv"
     OUTPUT_DIR  = f"./output/barcodes_{barcode_suffix}_amplicon_candidates/"
 
-    # Target chromosome
+    # ── Target chromosome ────────────────────────────────────────────────
     target_seqs_all = parse_sequences(find_fasta_files(ONLY_GENOME_DIR))
     if SEQ_ID not in target_seqs_all:
         print(f"\nERROR: '{SEQ_ID}' not found in {ONLY_GENOME_DIR}.")
         sys.exit(1)
     target_seqs = {SEQ_ID: target_seqs_all[SEQ_ID]}
 
-    # Off-target background
+    # ── Off-target background ─────────────────────────────────────────────
+    # Load ALL records from genome_and_plasmids including the target strain's
+    # own file — so primers are also checked for off-target binding within
+    # the target strain's own chromosome and plasmids.
+    # is_primer_pair_specific() excludes seq_id (the target sequence) from
+    # the check, so the intended amplification site is still allowed.
     off_target_seqs = parse_all_records_from_dir(BACKGROUND_DIR)
     specificity_seqs = off_target_seqs
 
-    # Primer3 config
-    PRODUCT_SIZE_RANGE = [80, 120]
+    # ── Primer3 config ────────────────────────────────────────────────────
+    PRODUCT_SIZE_RANGE = [105,105]
     primer_config = {
-        'flank_size': 300,
+        'flank_size': 150,
         'primer3_globals': {
-            'PRIMER_OPT_SIZE':           20,
+            'PRIMER_OPT_SIZE':           23,
             'PRIMER_MIN_SIZE':           18,
             'PRIMER_MAX_SIZE':           25,
             'PRIMER_OPT_TM':            60.0,
@@ -158,9 +200,11 @@ if __name__ == "__main__":
     }
 
     t0 = timer.perf_counter()
-    num_of_barcodes_checked = 100
+    num_of_barcodes_checked = 1000
 
-    # Design candidates separately for Ori and Ter
+    # ── Design candidates separately for Ori and Ter ─────────────────────
+    # Saves two files per isolate: SEQ_ID_Ori.csv and SEQ_ID_Ter.csv
+    # Stage 3 will then select one primer pair per (strain, region) = 36 total
     for region in ['Ori', 'Ter']:
         print(f"\n{'='*55}")
         print(f"Region: {region} — {SEQ_ID}")
@@ -171,13 +215,24 @@ if __name__ == "__main__":
             continue
         print(f"  Loaded {len(barcodes)} barcode candidates.")
 
-        candidates = design_candidate_primers(
-            target_seqs, specificity_seqs,
-            SEQ_ID, barcodes, primer_config,
-            num_of_barcodes_checked,
-        )
+        # Tiered search: try 1000 first, escalate to 50000 if no candidates found
+        for num_checked in [1000, 50000]:
+            print(f"  Trying with num_of_barcodes_checked={num_checked}...")
+            candidates = design_candidate_primers(
+                target_seqs, specificity_seqs,
+                SEQ_ID, barcodes, primer_config,
+                num_checked,
+            )
+            if candidates:
+                print(f"  Found {len(candidates)} candidates at n={num_checked}.")
+                break
+            else:
+                if num_checked < 50000:
+                    print(f"  No candidates at n={num_checked}, escalating...")
+                else:
+                    print(f"  Could not design any primers for {SEQ_ID} {region} even at n={num_checked}.")
+
         if not candidates:
-            print(f"  Could not design any primers for {SEQ_ID} {region}.")
             continue
 
         filename = f"{SEQ_ID}_{region}.csv"
